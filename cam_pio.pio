@@ -1,0 +1,62 @@
+.program cam_buffered
+
+.define PCLK  6
+.define HREF  5
+.define VSYNC 7
+.define VSYNC_OUT 17
+.define HREF_OUT  18
+
+; ──────────────────────────────────────────────────────────────────────────
+; 摄像头采集程序 - VSYNC 触发帧边界，HREF 控制行/字节循环
+;
+; 工作流程：
+;   1. 等待 VSYNC 上升沿
+;   2. 从 TX FIFO 读取 CPU 预装载的计数器值（720）
+;   3. 等待 HREF 上升沿
+;   4. 等待 PCLK 上升沿
+;   5. 读取 8-bit 数据到 ISR
+;   6. 等待 PCLK 下降沿
+;   7. 如果 HREF 仍为高电平，回到等待下一次 PCLK
+;   8. 如果 HREF 已低电平，push 当前 ISR，X 计数器递减
+;   9. 如果 X 仍大于 0，回到等待下一次 HREF
+; ──────────────────────────────────────────────────────────────────────────
+
+.wrap_target
+    set pins, 1               ; idle: VSYNC=1 (inactive), HREF=0
+    wait 1 gpio VSYNC         ; wait until VSYNC is high (idle)
+    wait 0 gpio VSYNC         ; wait for VSYNC falling edge -> frame start (active-low)
+    set pins, 0               ; VSYNC=0 (active), HREF=0
+    mov x, y                  ; 每帧开始时用预装载的 Y 重置行计数器
+
+line_wait:
+    wait 1 gpio HREF         ; wait for HREF high (line active)
+    set pins, 2              ; VSYNC=0 (active), HREF=1 (line active)
+
+byte_loop:
+    wait 1 gpio PCLK
+    in pins, 8
+    wait 0 gpio PCLK
+    jmp pin, byte_loop
+
+line_done:
+    set pins, 0               ; HREF=0, 保持 VSYNC=0 (frame still active)
+    jmp x--, line_wait
+.wrap
+
+
+% c-sdk {
+#include "cam_pio.h"
+
+static inline void cam_buffered_program_init(PIO pio, uint sm, uint offset)
+{
+    pio_sm_config c = cam_buffered_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, CAM_DATA_PIN_BASE);
+    sm_config_set_jmp_pin(&c, CAM_HREF_PIN);
+    sm_config_set_clkdiv(&c, 1.0f);
+    sm_config_set_in_shift(&c, false, true, 8);
+    sm_config_set_set_pins(&c, CAM_VSYNC_OUT_PIN, 2u);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}

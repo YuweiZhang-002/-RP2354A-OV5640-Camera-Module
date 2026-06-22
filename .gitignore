@@ -1,0 +1,7 @@
+build
+!.vscode/*
+!.docs/*
+!.pico_sdk_master/*
+.vscode/
+docs/
+pico-sdk-master/
