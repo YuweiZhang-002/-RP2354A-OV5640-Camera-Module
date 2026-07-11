@@ -1,0 +1,40 @@
+.program fpga_out
+.side_set 1
+
+.define FPGA_DATA_PIN_BASE 0
+.define FPGA_CLK_PIN   8
+
+; ──────────────────────────────────────────────────────────────────────────
+; PIO1 输出桥接程序
+;
+; 时序目标：
+;   1. 先把 8-bit 数据推出去, 时钟保持低电平
+;   2. 下一拍拉高时钟, 模拟 DCMI 建立时间
+;   3. 再保持 3 个 clk cycle
+;   4. 拉低时钟, 完成一个输出窗口
+;
+; 说明：GP20 的控制输出由上层协议/后续状态机接管,这里不再保留旧输入握手逻辑。
+; ──────────────────────────────────────────────────────────────────────────
+
+
+
+.wrap_target
+    out pins, 8         side 0   ; 先送出 8-bit 数据,时钟保持低电平
+    set pins, 1         side 0   ; GP20 先拉高，标记输出窗口开始
+    nop                 side 1   ; 再保持 1 个 clk cycle
+    set pins, 0         side 0   ; 过 2 个 clk cycles 后拉低 GP20
+.wrap
+
+
+% c-sdk {
+#include "fpga_pio.h"
+
+static inline void fpga_out_program_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = fpga_out_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, FPGA_DATA_PIN_BASE, 8);    // D0'-D7' = GP0-7
+    sm_config_set_sideset_pins(&c, FPGA_CLK_PIN);         // 时钟输出 = GP8
+    sm_config_set_out_shift(&c, false, true, 8);
+    sm_config_set_clkdiv(&c, 1.5f);                       // 24MHz 字节时钟
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}

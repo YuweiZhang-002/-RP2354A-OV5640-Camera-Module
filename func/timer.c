@@ -6,6 +6,7 @@
 
 #include "../header/timer.h"
 
+
 static const uint32_t camera_core_hz = 144u * 1000u * 1000u;
 static const uint32_t camera_usb_adc_hz = 48u * 1000u * 1000u;
 static const uint32_t camera_ov5640_xclk_gpio = 21u;
@@ -15,10 +16,6 @@ void timer_config(void)
     /*
      * RP2354 时钟初始化 —— 最小三步骤 + 外设级分频
      *
-     *   PLL_SYS : VCO = XOSC(12 MHz) * FBDIV(125) = 1500 MHz
-     *             out = 1500 / (POSTDIV1=5 * POSTDIV2=2) = 150 MHz
-     *             VCO ∈ [750, 1600] MHz，FBDIV ∈ [16, 320]，POSTDIVx ∈ [1, 7]，全部满足
-     *   PLL_USB : VCO = 12 MHz * 100 = 1200 MHz, out = 1200 / 25 = 48 MHz
      *
      *   150 MHz 是 RP2354 数据手册给出的 clk_sys 硬上限，再往上推不保证可靠。
      */
@@ -39,20 +36,21 @@ void timer_config(void)
 
     /* ── 步骤 2：配置 PLL_SYS / PLL_USB ───────────────────────── */
     // void pll_init(PLL pll, uint refdiv, uint vco_freq, uint post_div1, uint post_div2)
-    pll_init(pll_sys, 1, 576 * MHZ, 4, 1);   /* 144 MHz */
-    pll_init(pll_usb, 1, 576 * MHZ, 4, 3);   /* 48 MHz */
-
+    // VCO = 12MHz × FBDIV(72) = 864MHz  (在 750~1600MHz 合法区间内)
+    // out = 864MHz / (POSTDIV1=6 × POSTDIV2=1) = 144MHz，精确无余数
+    pll_init(pll_sys, 1, 864 * MHZ, 6, 1);
+    // PLL_USB 用官方验证过的标准默认值即可，不需要自己凑
+    // VCO = 12MHz × FBDIV(100) = 1200MHz / (5×5) = 48MHz
+    pll_init(pll_usb, 1, 1200 * MHZ, 5, 5);
     /* ── 步骤 3：clk_ref ← XOSC，clk_sys ← PLL_SYS ────────────── */
     clock_configure_undivided(clk_ref,
         CLOCKS_CLK_REF_CTRL_SRC_VALUE_XOSC_CLKSRC,
         0,
         XOSC_HZ);
-
     clock_configure_undivided(clk_sys,
         CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLKSRC_CLK_SYS_AUX,
         CLOCKS_CLK_SYS_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
         camera_core_hz);
-
     /* ── 外设级分频：用每条 clk_xxx 自己的分频器，绝不回去改 PLL ── */
 
     /* clk_peri ← clk_sys / 1 = 144 MHz （SPI/UART/I2C 主时钟） */
@@ -61,7 +59,6 @@ void timer_config(void)
         CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
         camera_core_hz,
         1);
-
 
     /* clk_usb ← PLL_USB = 48 MHz */
     clock_configure_undivided(clk_usb,
@@ -102,4 +99,7 @@ void clock_DCMI_config(void)
         CLOCKS_CLK_GPOUT0_CTRL_AUXSRC_VALUE_CLK_SYS,
         6u,
         0u);
+
+    gpio_set_drive_strength(camera_ov5640_xclk_gpio, GPIO_DRIVE_STRENGTH_8MA);
+    gpio_set_slew_rate(camera_ov5640_xclk_gpio, GPIO_SLEW_RATE_FAST);
 }

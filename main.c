@@ -2,12 +2,12 @@
  * main.c  —  RP2354 PIO 摄像头采集最小 Demo
  *
  * 完整数据流（单向闭合）：
- *   GPIO 22-29/6/5/7 → PIO 状态机 → RX FIFO → DMA → 行级三缓冲环
- *     → 主循环 cam_acquire_line() → HSTX 发送 → cam_release_line()
+ *   GPIO 0-7/8/10/9 → PIO 状态机 → RX FIFO → DMA → 行级三缓冲环
+ *     → 主循环 cam_acquire_line() → PIO1 发送 → cam_release_line()
  *
  * 三条链各管各的，主循环只做单点编排：
  *   - 采集链：PIO+DMA 在完成中断里自维持地逐行采集（cam_pio.c）
- *   - 发送链：主循环把就绪行交给 HSTX，互不在同一中断路径（hstx.c）
+ *   - 发送链：主循环把就绪行交给 PIO1 发送，互不在同一中断路径（fpga_pio.c）
  *   - IMU 链：按 VSYNC 帧边界(frame_ready)自采样、FIFO、串口外发（imu.c）
  *
  * 初始化职责分离：
@@ -24,8 +24,7 @@
 #include "header/ov5640.h"
 #include "cam_pio.h"
 #include "ov5640_set.h"
-#include "imu.h"
-#include "hstx.h"
+#include "fpga_pio.h"
 
 
 /* 系统循环，用于强制终止出现ERROR的程序 */
@@ -34,39 +33,17 @@ void sys_loop(void)
     while(1);
 }
 
-/* 初始化FPGA关联引脚 */
-void fpga_gpio_init(void) {
-    /* FPGA开发板传来1个引脚：GPIO 11，配置为输入并上拉 */
-    gpio_init(11);
-    gpio_set_dir(11, GPIO_IN);
-    gpio_set_pulls(11, true, false);
-}
 
-/* 检测FPGA_EN电平机制
- * EN 低有效：GPIO 11 = 0 表示进入工作状态，= 1（含 FPGA 未驱动时的上拉默认）表示关闭。
- * 状态保存在文件全局 is_fpga_en，只在电平跳变时启停，避免重复写寄存器。 */
-bool is_fpga_en = false;
+/* */
+volatile bool work = false;
 
-void check_fpga_en(void) {
-    bool en_level = (gpio_get(11) == 0);   /* 低有效：低=工作 */
-
-    if (!is_fpga_en && en_level) {
-        /* 关→开：先唤醒传感器，待 PLL/AEC 稳定后再启动采集，避开首帧垃圾/采集卡死 */
-        if (OV5640_SetActivation(OV5640_PowerUp) != OV5640_OK) {
-            return;                         /* I2C 失败：保持关闭，下一轮重试 */
-        }
-        sleep_ms(20);
-        cam_capture_start();
-        is_fpga_en = true;
-    }
-    else if (is_fpga_en && !en_level) {
-        /* 开→关：先干净停采集（此时 PCLK 仍在，DMA abort 可靠），再休眠传感器 */
-        cam_capture_stop();
-        OV5640_SetActivation(OV5640_PowerDown);
-        is_fpga_en = false;
-    }
-}
-
+/*
+ * 注意：`FPGA_CTRL_PIN` 在设计语义上是一个由 FPGA/板上逻辑提供的
+ * 输入信号，用以指示 OV5640 与采集/发送链的工作状态（例如：进入
+ * 采集模式或停止）。该信号在当前开发阶段暂不使用——我们在
+ * header/fpga_pio.h 中将其宏注释掉以避免误用。未来若需重新启用，
+ * 可在此处添加基于该输入的启动/停止逻辑或其它策略。
+ */
 
 int main(void)
 {
@@ -78,64 +55,55 @@ int main(void)
 
     /* 1. GPIO 复用与上拉/下拉初始化 */
     cam_gpio_init();
-    hstx_gpio_init();
-    /* 补充：添加FPGA开发板传来的引脚初始化 */
     fpga_gpio_init();
 
-    /* 2. PIO 程序和 HSTX 控制器初始化 */
+    /* 2. PIO 程序和 DMA 初始化 */
     cam_pio_init();
-    hstx_init();
+    fpga_pio_init();
 
     /* 3. DMA 通道申请与 DREQ 绑定，但不立即触发 */
     cam_dma_init();
-    hstx_dma_init();
+    fpga_dma_init();
 
     /* 4. OV5640 SCCB/I2C 与上电时序 */
     ov5640_i2c_init();
     ov5640_pin_init();
 
+    /* 唤醒窗口内的前 3 帧不参与后续处理 */
+    cam_discard_next_frames(3u);
+
     /* 5. 传感器参数配置：若芯片 ID 或寄存器写入失败则直接停机 */
-    status = OV5640_Init(BMP_1280x720, OV5640_RGB565, OV5640_Polarity_4);
+    status = OV5640_Init(BMP_1280x720, OV5640_Y8, OV5640_Polarity_4);
     if (status != 0) {
         sys_loop();
     }
 
-    /* 6. IMU 初始化：SPI / UART / UART-TX-DMA；WHO_AM_I 校验失败则停机 */
-    status = icm45686_init();
-    if (status != 0) {
-        sys_loop();
-    }
-
-
-    /* 当前是否有一行正在经 HSTX 发送（在飞） */
-    bool hstx_line_inflight = false;
+    /* 当前是否有一行正在经 PIO1 发送（在飞） */
+    bool fpga_line_inflight = false;
+    /* 6. 启动连续采集（DMA+PIO0） */
+    ov5640_start_capture(); 
 
     while (true) {
-        /* 验证是否进入工作状态（检测电平） */
-        check_fpga_en();
-
         /* —— 发送链：与采集链解耦，仅通过 acquire/release 单点交接 —— */
 
         /* 1) 上一行发送完成 → 归还缓冲，供采集复用 */
-        if (hstx_line_inflight && !hstx_dma_busy()) {
+        if (fpga_line_inflight && !fpga_dma_busy()) {
             cam_release_line();
-            hstx_line_inflight = false;
+            fpga_line_inflight = false;
         }
 
-        /* 2) 空闲且有就绪行 → 启动一次 HSTX 发送 */
-        if (!hstx_line_inflight) {
+        /* 2) 空闲且有就绪行 → 启动一次 PIO1 发送 */
+        if (!fpga_line_inflight) {
             uint8_t *line = cam_acquire_line();
             if (line != NULL) {
-                hstx_tx_start(line);
-                hstx_line_inflight = true;
+                fpga_tx_start(line);
+                fpga_line_inflight = true;
             }
         }
 
-        /* —— IMU 链：按帧边界独立采样并外发，不阻塞发送链 —— */
-        if (frame_ready == 1u) {
-            frame_ready = 0u;
-            /* 直读一帧并经 UART DMA 异步外发；非阻塞，发送在后台进行 */
-            (void)icm45686_stream_sample();
-        }
+        /*
+         * IMU 采样链已在当前设计中停用（imu.c 保留但不被 main 调用）。
+         * 若未来需要按帧边界采样，请在此处恢复调用。
+         */
     }
 }

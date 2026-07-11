@@ -64,14 +64,14 @@ extern "C" {
 /* ------------------------------------------------------------------------- */
 
 /* OV5640 7-bit SCCB address (SADDR pin low -> 0x3C). */
-#define OV5640_I2C_INST   i2c0
-#define OV5640_I2C_SDA    10u
-#define OV5640_I2C_SCL    9u
+#define OV5640_I2C_INST   i2c1
+#define OV5640_I2C_SDA    26u
+#define OV5640_I2C_SCL    27u
 #define OV5640_SCCB_ADDR  0x3Cu
 
 /* 上电控制引脚（低电平有效的 PWDN/RESETB 由 GPIO 直接驱动） */
-#define OV5640_PWDN_PIN   14u
-#define OV5640_RST_PIN    8u
+#define OV5640_PWDN_PIN   28u
+#define OV5640_RST_PIN    22u
 
 /* Chip ID registers. */
 #define OV5640_REG_PIDH   0x300Au

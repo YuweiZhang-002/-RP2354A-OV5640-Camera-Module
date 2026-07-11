@@ -34,7 +34,8 @@ typedef enum{
 	BMP_640x480 = 1,
   BMP_800x480 = 2,
   BMP_1280x720 = 3,
-  BMP_DEFAULT = 4,
+  BMP_800x600 = 4,
+  BMP_DEFAULT = 5,
 }ImageFormatTypeDef;
 
 

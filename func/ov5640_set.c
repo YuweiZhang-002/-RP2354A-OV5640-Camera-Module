@@ -5,6 +5,19 @@
 
 volatile uint8_t isInitialised = 0;
 
+static int32_t ov5640_apply_regs(const sensor_reg_t *regs, uint32_t count)
+{
+  for (uint32_t i = 0U; i < count; i++)
+  {
+    if (ov5640_write_reg(regs[i].reg, (uint8_t)regs[i].value) != 0U)
+    {
+      return OV5640_ERROR;
+    }
+  }
+
+  return OV5640_OK;
+}
+
 
 
 int32_t OV5640_Init(uint32_t Resolution, uint32_t PixelFormat, uint32_t Polarity)
@@ -26,12 +39,10 @@ int32_t OV5640_Init(uint32_t Resolution, uint32_t PixelFormat, uint32_t Polarity
    *    这部分决定传感器是否真的会输出 DVP 数据。
    *    写失败则说明 SCCB 事务或寄存器依赖链异常。
    */
-  for (size_t i = 0; i < sizeof(ov5640_init_common) / sizeof(ov5640_init_common[0]); i++)
+  ret = ov5640_apply_regs(ov5640_init_common, (uint32_t)(sizeof(ov5640_init_common) / sizeof(ov5640_init_common[0])));
+  if (ret != OV5640_OK)
   {
-    if (ov5640_write_reg(ov5640_init_common[i].reg, (uint8_t)ov5640_init_common[i].value) != 0U)
-    {
-      return OV5640_ERROR; /* 任何寄存器写入失败都立即返回错误 */
-    }
+    return OV5640_ERROR;
   }
   
   /* 4) 启用 DVP 模式：切到并行口输出 */
@@ -54,6 +65,17 @@ int32_t OV5640_Init(uint32_t Resolution, uint32_t PixelFormat, uint32_t Polarity
 
   /* 7) 设置极性 */
   if (OV5640_SetPolarity(Polarity) != OV5640_OK)
+  {
+    return OV5640_ERROR;
+  }
+
+  /* 8) 完成后执行一次软待机/唤醒，重对齐内部帧发生器 */
+  if (ov5640_write_reg(0x3008u, 0x42u) != 0U)
+  {
+    return OV5640_ERROR;
+  }
+  sleep_ms(10);
+  if (ov5640_write_reg(0x3008u, 0x02u) != 0U)
   {
     return OV5640_ERROR;
   }
@@ -112,15 +134,7 @@ int32_t OV5640_SetPixelFormat(uint32_t PixelFormat)
       return OV5640_ERROR;
   }
 
-  for (i = 0U; i < count; i++)
-  {
-    if (ov5640_write_reg(regs[i].reg, (uint8_t)regs[i].value) != 0U)
-    {
-      return OV5640_ERROR;
-    }
-  }
-
-  return OV5640_OK;
+  return ov5640_apply_regs(regs, count);
 }
 
 
@@ -129,7 +143,6 @@ int32_t OV5640_SetResolution(uint32_t Resolution)
 {
   const sensor_reg_t *regs;
   uint32_t count;
-  uint32_t i;
 
   switch (Resolution)
   {
@@ -148,29 +161,23 @@ int32_t OV5640_SetResolution(uint32_t Resolution)
       count = sizeof(ov5640_wvga_regs) / sizeof(ov5640_wvga_regs[0]);
       break;
 
+    case BMP_800x600:
+      regs  = ov5640_800x600_regs;
+      count = sizeof(ov5640_800x600_regs) / sizeof(ov5640_800x600_regs[0]);
+      break;
+
     case BMP_1280x720:
       regs  = ov5640_svga_regs;
       count = sizeof(ov5640_svga_regs) / sizeof(ov5640_svga_regs[0]);
       break;
 
-    case BMP_DEFAULT:
+    default:
       regs  = ov5640_wvga_regs;
       count = sizeof(ov5640_wvga_regs) / sizeof(ov5640_wvga_regs[0]);
       break;
-
-    default:
-      return OV5640_ERROR;
   }
 
-  for (i = 0U; i < count; i++)
-  {
-    if (ov5640_write_reg(regs[i].reg, (uint8_t)regs[i].value) != 0U)
-    {
-      return OV5640_ERROR;
-    }
-  }
-
-  return OV5640_OK;
+  return ov5640_apply_regs(regs, count);
 }
 
 
@@ -186,18 +193,9 @@ int32_t OV5640_SetResolution(uint32_t Resolution)
   */
 int32_t OV5640_EnableDVPMode(void)
 {
-  uint32_t i;
   uint32_t count = sizeof(ov5640_init_dvp) / sizeof(ov5640_init_dvp[0]);
 
-  for (i = 0U; i < count; i++)
-  {
-    if (ov5640_write_reg(ov5640_init_dvp[i].reg, (uint8_t)ov5640_init_dvp[i].value) != 0U)
-    {
-      return OV5640_ERROR;
-    }
-  }
-
-  return OV5640_OK;
+  return ov5640_apply_regs(ov5640_init_dvp, count);
 }
 
 
@@ -226,12 +224,7 @@ int32_t OV5640_SetPolarity(uint32_t Polarity)
     return OV5640_ERROR;
   }
 
-  if (ov5640_write_reg(ov5640_polarity_regs[Polarity].reg, (uint8_t)ov5640_polarity_regs[Polarity].value) != 0U)
-  {
-    return OV5640_ERROR;
-  }
-
-  return OV5640_OK;
+  return ov5640_apply_regs(&ov5640_polarity_regs[Polarity], 1U);
 }
 
 
@@ -243,10 +236,5 @@ int32_t OV5640_SetActivation(uint32_t Activation)
     return OV5640_ERROR;
   }
 
-  if (ov5640_write_reg(ov5640_power_regs[Activation].reg, (uint8_t)ov5640_power_regs[Activation].value) != 0U)
-  {
-    return OV5640_ERROR;
-  }
-
-  return OV5640_OK;
+  return ov5640_apply_regs(&ov5640_power_regs[Activation], 1U);
 }

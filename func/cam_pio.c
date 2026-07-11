@@ -3,14 +3,14 @@
  *
  * 数据流（单向闭合）：
  *   OV5640 DVP 并行口 (8-bit data + PCLK/HREF/VSYNC)
- *     ▼  GPIO 22-29 / 6 / 5 / 7    ← pio_gpio_init() 接管复用
+ *     ▼  GPIO 12-19 / 11 / 10 / 20  ← pio_gpio_init() 接管复用
  *   PIO0 SM0                       ← cam_pio.pio 程序
  *     ▼  RX FIFO 非空 → 拉高 RX DREQ
  *   DMA Channel (8-bit/byte)       ← 写入 cam_frame_buf[w]
  *     ▼  写满一行 (CAPTURE_BYTES) → DMA 完成中断
- *   完成中断：把该块标记为"就绪"，立即重装到环里下一块（无忙等、无 HSTX 调用）
+ *   完成中断：把该块标记为"就绪"，立即重装到环里下一块（无忙等、无旧 HSTX 调用）
  *     ▼
- *   主循环 cam_acquire_line() 取走就绪块 → HSTX 发送 → cam_release_line() 归还
+ *   主循环 cam_acquire_line() 取走就绪块 → PIO1 发送 → cam_release_line() 归还
  *
  * 关键设计：
  *   - 采集层只生产 + 打标记，不直接驱动发送层（解耦）。
@@ -47,7 +47,7 @@ static uint8_t cam_frame_buf[CAM_NUM_BUFFERS][CAPTURE_BYTES];
 /*
  * 用三个单调递增序号描述生产/消费进度（无符号差值在回绕下仍成立）：
  *   cam_prod_seq — 已写满的行数；DMA 当前写入 cam_frame_buf[prod % N]
- *   cam_send_seq — 已派发给 HSTX 的行数；发送中的块下标 = (send-1) % N
+ *   cam_send_seq — 已派发给 PIO1 的行数；发送中的块下标 = (send-1) % N
  *   cam_cons_seq — 已发送完成并归还的行数
  * 不变式：cam_cons_seq <= cam_send_seq <= cam_prod_seq，且 send-cons <= 1（单条在飞）。
  *
@@ -60,6 +60,9 @@ static volatile uint32_t cam_cons_seq = 0u;
 
 volatile uint8_t  frame_ready       = 0u;
 volatile uint32_t cam_overrun_count = 0u;
+volatile uint32_t cam_frame_count   = 0u;
+volatile bool     dma_flag          = false;
+static volatile uint8_t cam_warmup_discard_frames = 0u;
 
 /* ────────────────────────────────────────────────────────────────────────────
  *  GPIO 初始化
@@ -84,9 +87,10 @@ void cam_gpio_init(void)
     gpio_set_dir(CAM_VSYNC_PIN, GPIO_IN);
     gpio_set_pulls(CAM_VSYNC_PIN, true, false);
 
-    gpio_init(CAM_FRAME_VALID); /* 预留 GPIO11 用于调试输出 */
-    gpio_set_dir(CAM_FRAME_VALID, GPIO_OUT);
-    gpio_put(CAM_FRAME_VALID, false);
+    gpio_init(CAM_DEBUG_PIN);
+    gpio_set_dir(CAM_DEBUG_PIN, GPIO_OUT);
+    gpio_put(CAM_DEBUG_PIN, 0);
+
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -94,7 +98,7 @@ void cam_gpio_init(void)
  * ──────────────────────────────────────────────────────────────────────────*/
 void cam_pio_init(void)
 {
-    uint offset = pio_add_program(cam_pio, &cam_buffered_program);
+    uint offset = pio_add_program(cam_pio, &cam_capture_program);
 
     for (uint i = 0u; i < CAM_DATA_PIN_COUNT; ++i) {
         pio_gpio_init(cam_pio, CAM_DATA_PIN_BASE + i);
@@ -103,23 +107,13 @@ void cam_pio_init(void)
     pio_gpio_init(cam_pio, CAM_HREF_PIN);
     pio_gpio_init(cam_pio, CAM_VSYNC_PIN);
 
-    /* PIO 输出引脚：交给状态机驱动，用于 VSYNC/HREF 的可观察输出 */
-    pio_gpio_init(cam_pio, CAM_VSYNC_OUT_PIN);
-    pio_gpio_init(cam_pio, CAM_HREF_OUT_PIN);
-
     pio_sm_set_consecutive_pindirs(cam_pio, cam_sm,
                                    CAM_DATA_PIN_BASE, CAM_DATA_PIN_COUNT, false);
     pio_sm_set_consecutive_pindirs(cam_pio, cam_sm, CAM_PCLK_PIN,  1u, false);
     pio_sm_set_consecutive_pindirs(cam_pio, cam_sm, CAM_HREF_PIN,  1u, false);
     pio_sm_set_consecutive_pindirs(cam_pio, cam_sm, CAM_VSYNC_PIN, 1u, false);
-    pio_sm_set_consecutive_pindirs(cam_pio, cam_sm, CAM_VSYNC_OUT_PIN, 2u, true);
 
-    cam_buffered_program_init(cam_pio, cam_sm, offset);
-
-    /* 一次性把 FRAME_LOOPS 装入 Y 寄存器（每帧用于重置行计数器）*/
-    pio_sm_put_blocking(cam_pio, cam_sm, FRAME_LOOPS);
-    pio_sm_exec(cam_pio, cam_sm, pio_encode_pull(false, false));
-    pio_sm_exec(cam_pio, cam_sm, pio_encode_mov(pio_y, pio_osr));
+    cam_capture_program_init(cam_pio, cam_sm, offset);
 
     pio_sm_set_enabled(cam_pio, cam_sm, false);
 }
@@ -159,6 +153,8 @@ static void cam_dma_irq_handler(void)
         /* 发布刚写满的块（prod_seq 前进），重装到下一块继续采集。 */
         cam_prod_seq = next;
         cam_dma_rearm(cam_prod_seq % CAM_NUM_BUFFERS);
+        dma_flag = !dma_flag;
+        gpio_put(CAM_DEBUG_PIN, dma_flag);
     }
 }
 
@@ -185,8 +181,8 @@ void cam_dma_init(void)
                            PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
     irq_set_enabled(DMA_IRQ_0, true);
 
-    /* VSYNC 作为帧边界事件：rise 点亮调试脚，fall 置 frame_ready 供 IMU 按帧采样。
-     * 注意：HREF 不再参与采集/发送交接，避免把两条链焊在同一中断路径上。 */
+    /* VSYNC 作为帧边界事件：仅做轻量记账与帧就绪标记。
+     * 注意：HREF 不参与 CPU 交接，数据流仍由 PIO + DMA 负责。 */
     gpio_set_irq_enabled_with_callback(CAM_VSYNC_PIN,
                                        GPIO_IRQ_EDGE_RISE,
                                        true,
@@ -208,6 +204,10 @@ void cam_capture_start(void)
     cam_send_seq      = 0u;
     cam_cons_seq      = 0u;
     cam_overrun_count = 0u;
+    cam_frame_count   = 0u;
+    frame_ready       = 0u;
+    dma_flag          = false;
+    gpio_put(CAM_DEBUG_PIN, 0);
 
     /* 首块完整配置（设定读地址=RX FIFO，写地址=buf0，计数与触发）；
      * 之后的重装走 cam_dma_rearm() 快速路径。 */
@@ -220,6 +220,12 @@ void cam_capture_start(void)
         true);
 
     pio_sm_set_enabled(cam_pio, cam_sm, true);
+}
+
+void cam_discard_next_frames(uint8_t frames)
+{
+    cam_warmup_discard_frames = frames;
+    frame_ready = 0u;
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -266,11 +272,34 @@ void cam_release_line(void)
 static void cam_gpio_irq_callback(uint gpio, uint32_t events)
 {
     if (gpio == CAM_VSYNC_PIN && (events & GPIO_IRQ_EDGE_RISE)) {
-        gpio_put(CAM_FRAME_VALID, true);
+        cam_frame_count++;
     }
 
     if (gpio == CAM_VSYNC_PIN && (events & GPIO_IRQ_EDGE_FALL)) {
-        gpio_put(CAM_FRAME_VALID, false);
+        if (cam_warmup_discard_frames > 0u) {
+            cam_warmup_discard_frames--;
+            frame_ready = 0u;
+            return;
+        }
         frame_ready = 1u;
     }
+}
+
+/* ------------------------------------------------------------------
+ * 4x4-buffer scaffold implementation
+ * - 提供预留函数以便未来将行级三缓冲替换为 4 个 4-line blocks。
+ * - 当前实现为占位：记录意图并在将来扩展点放置 TODO。
+ * - 该函数不会在当前默认路径中自动切换行为，需由上层显式调用并
+ *   在切换前完成内存与时序验证。
+ */
+void cam_enable_4x4_scaffold(void)
+{
+    /* TODO: 实现迁移逻辑：
+     *  - 分配或重构缓冲数组为 [CAM_4X4_NUM_BUFFERS][CAPTURE_CHUNK_LINES * CAPTURE_BYTES]
+     *  - 更新 cam_dma_rearm() 以按 chunk 写地址与计数重装
+     *  - 在 DMA 完成中断里维护行计数并在 chunk 完成时发布
+     *  - 更新 cam_acquire_line()/cam_release_line() 以按 chunk 返回指针
+     *  - 验证 RAM 占用（CAM_4X4_NUM_BUFFERS * CAPTURE_CHUNK_LINES * CAPTURE_BYTES）
+     */
+    /* 占位注释：当前仅作文档记录，不修改运行时数据结构 */
 }

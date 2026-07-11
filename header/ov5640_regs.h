@@ -759,45 +759,45 @@ static const sensor_reg_t ov5640_init_common[] = {
     {OV5640_LIGHTMETER2_TH_LOW, 0x2c},
     {OV5640_SAMPLE_NUMBER_HIGH, 0x9c},
     {OV5640_SAMPLE_NUMBER_LOW, 0x40},
-    {OV5640_TIMING_TC_REG20, 0x40},
-    {OV5640_TIMING_TC_REG21, 0x07},
+    {OV5640_TIMING_TC_REG20, 0x41},
+    {OV5640_TIMING_TC_REG21, 0x01},
     {OV5640_TIMING_X_INC, 0x31},
     {OV5640_TIMING_Y_INC, 0x31},
-    {OV5640_TIMING_HS_HIGH, 0x01},
-    {OV5640_TIMING_HS_LOW, 0xB4},
-    {OV5640_TIMING_VS_HIGH, 0x01},
-    {OV5640_TIMING_VS_LOW, 0x4C},
-    {OV5640_TIMING_HW_HIGH, 0x08},
-    {OV5640_TIMING_HW_LOW, 0x6B},
-    {OV5640_TIMING_VH_HIGH, 0x05}, /* VH=0x05FB (1531): VS+1199, source height 1200 */
-    {OV5640_TIMING_VH_LOW,  0xFB}, /*   post-sub 600 == output 600, no scaler skip   */
-    {OV5640_TIMING_DVPHO_HIGH, 0x03},
-    {OV5640_TIMING_DVPHO_LOW, 0x20},
-    {OV5640_TIMING_DVPVO_HIGH, 0x02},
-    {OV5640_TIMING_DVPVO_LOW, 0x58},
-    {OV5640_TIMING_HTS_HIGH, 0x06},  /* HTS = 0x06E0 (1760) for 800x600 */
-    {OV5640_TIMING_HTS_LOW, 0xE0},
-    {OV5640_TIMING_VTS_HIGH, 0x02},  /* VTS = 0x02A8 (680) for 800x600 */
-    {OV5640_TIMING_VTS_LOW, 0xA8},
-    {OV5640_TIMING_HOFFSET_HIGH, 0x00}, /* HOFFSET=30 (0x1E): center 800 in post-sub 860 */
-    {OV5640_TIMING_HOFFSET_LOW,  0x1E},
-    {OV5640_TIMING_VOFFSET_HIGH, 0x00}, /* VOFFSET=0: VTS=680 truncates src 1280->1200, */
-    {OV5640_TIMING_VOFFSET_LOW,  0x00}, /*            post-sub effective = 600, no room to crop */
+    {OV5640_TIMING_HOFFSET_HIGH, 0x00},
+    {OV5640_TIMING_HOFFSET_LOW, 0x10},   // H OFFSET = 832
+    {OV5640_TIMING_VOFFSET_HIGH, 0x00},
+    {OV5640_TIMING_VOFFSET_LOW, 0x04},   // V OFFSET = 500
+    {OV5640_TIMING_HS_HIGH,     0x00},
+    {OV5640_TIMING_HS_LOW,      0x00},   // X_ADDR_START = 0
+    {OV5640_TIMING_VS_HIGH,     0x00},
+    {OV5640_TIMING_VS_LOW,      0xfa},   // Y_ADDR_START = 250
+    {OV5640_TIMING_HW_HIGH,     0x0a},
+    {OV5640_TIMING_HW_LOW,      0x3f},   // X_ADDR_END = 2623
+    {OV5640_TIMING_VH_HIGH,     0x06},
+    {OV5640_TIMING_VH_LOW,      0xA9},   // Y_ADDR_END = 1705
+    {OV5640_TIMING_DVPHO_HIGH,  0x05},
+    {OV5640_TIMING_DVPHO_LOW,   0x00},   // DVPHO = 1280
+    {OV5640_TIMING_DVPVO_HIGH,  0x02},
+    {OV5640_TIMING_DVPVO_LOW,   0xd0},   // DVPVO = 720
+    {OV5640_TIMING_HTS_HIGH,    0x07},
+    {OV5640_TIMING_HTS_LOW,     0x64},   // HTS = 1892
+    {OV5640_TIMING_VTS_HIGH,    0x02},
+    {OV5640_TIMING_VTS_LOW,     0xE4},   // VTS = 740
+    {OV5640_AEC_CTRL02, 0x02},
+    {OV5640_AEC_CTRL03, 0xE0},
+    {OV5640_AEC_MAX_EXPO_HIGH, 0x02},
+    {OV5640_AEC_MAX_EXPO_LOW, 0xE0},
+    {OV5640_AEC_CTRL0D, 0x04},
+    {OV5640_AEC_CTRL0E, 0x03},
     {0x3618, 0x00},
     {0x3612, 0x29},
     {0x3708, 0x64},
     {0x3709, 0x52},
     {0x370c, 0x03},
-    {OV5640_AEC_CTRL02, 0x03},
-    {OV5640_AEC_CTRL03, 0xd8},
     {OV5640_AEC_B50_STEP_HIGH, 0x01},
     {OV5640_AEC_B50_STEP_LOW, 0x27},
     {OV5640_AEC_B60_STEP_HIGH, 0x00},
     {OV5640_AEC_B60_STEP_LOW, 0xf6},
-    {OV5640_AEC_CTRL0E, 0x03},
-    {OV5640_AEC_CTRL0D, 0x04},
-    {OV5640_AEC_MAX_EXPO_HIGH, 0x03},
-    {OV5640_AEC_MAX_EXPO_LOW, 0xd8},
     {OV5640_BLC_CTRL01, 0x02},
     {OV5640_BLC_CTRL04, 0x02},
     {OV5640_SYSREM_RESET00, 0x00},
@@ -807,16 +807,11 @@ static const sensor_reg_t ov5640_init_common[] = {
     {OV5640_MIPI_CONTROL00, 0x58},
     {0x302e, 0x00},
     {OV5640_POLARITY_CTRL, 0x22},
-    {OV5640_FORMAT_CTRL00, 0x6F},
-    {OV5640_FORMAT_MUX_CTRL, 0x01},
+    {OV5640_FORMAT_CTRL00, 0x10},
+    {OV5640_FORMAT_MUX_CTRL, 0x00},
     {OV5640_JPG_MODE_SELECT, 0x03},
     {OV5640_JPEG_CTRL07, 0x04},
     {0x440e, 0x00},
-    /* Adjust VFIFO / DVP clock control for 36MHz PCLK target */
-    {0x460b, 0x37}, /* VFIFO HSIZE control */
-    {0x460c, 0x22}, /* bit[1]=0 -> DVP PCLK divider controlled by 0x3824 */
-    {OV5640_PCLK_PERIOD, 0x1C}, /* PCLK period: 576MHz(ref)/36MHz(target)~16=0x10 */
-    {0x3824, 0x02}, /* PCLK manual divider = 2 (no further division) */
     {OV5640_ISP_CONTROL00, 0xa7},
     {OV5640_ISP_CONTROL01, 0xa3},
     {OV5640_AWB_CTRL00, 0xff},
@@ -990,13 +985,17 @@ static const sensor_reg_t ov5640_init_dvp[] = {
     /* DVP pad output enable: D[9:2], HREF, VSYNC, PCLK, GPIO0/1 */
     {OV5640_PAD_OUTPUT_ENABLE01, 0xFF},
     {OV5640_PAD_OUTPUT_ENABLE02, 0xF3},
+    {0x302e, 0x00},
+    /* Unknown DVP control configuration */
+    {0x471c, 0x50},
+    {OV5640_MIPI_CONTROL00, 0x58},
+    /* Timing configuration */
 
     /* DVP-mode system / PLL configuration (parallel-output clock path) */
-    /* Tuned for 36MHz PCLK: multiplier=0x40, root_div=0x03 */
     {OV5640_SC_PLL_CONTRL0,      0x18},
     {OV5640_SC_PLL_CONTRL1,      0x41},
-    {OV5640_SC_PLL_CONTRL2,      0x60},  /* PLL multiplier: 0x48, 72 in decimal */
-    {OV5640_SC_PLL_CONTRL3,      0x13},  /* root divider: 0x13->0x03 */
+    {OV5640_SC_PLL_CONTRL2,      0x60},
+    {OV5640_SC_PLL_CONTRL3,      0x13},
     {OV5640_SYSTEM_ROOT_DIVIDER, 0x01},
 };
 
@@ -1019,6 +1018,14 @@ static const sensor_reg_t ov5640_wvga_regs[] = {
     {OV5640_TIMING_DVPHO_LOW, 0x20},
     {OV5640_TIMING_DVPVO_HIGH, 0x01},
     {OV5640_TIMING_DVPVO_LOW, 0xE0},
+};
+
+// 800x600
+static const sensor_reg_t ov5640_800x600_regs[] = {
+  {OV5640_TIMING_DVPHO_HIGH, 0x03},
+  {OV5640_TIMING_DVPHO_LOW,  0x20},
+  {OV5640_TIMING_DVPVO_HIGH, 0x02},
+  {OV5640_TIMING_DVPVO_LOW,  0x58},
 };
 
 // VGA(640*480)  
@@ -1113,7 +1120,7 @@ static const sensor_reg_t ov5640_power_regs[] = {
     /* Power adjustment: Power down */
     {OV5640_SYSTEM_CTROL0, 0x42},
     /* Power adjustment: Reset */
-    {OV5640_SYSTEM_CTROL0, 0x82},
+    {OV5640_SYSTEM_CTROL0, 0x80},
 };
 
 #endif /* OV5640_REGS_H */

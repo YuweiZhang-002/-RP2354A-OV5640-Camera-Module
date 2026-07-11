@@ -5,3 +5,5 @@ build
 .vscode/
 docs/
 pico-sdk-master/
+.bin
+*.bin
