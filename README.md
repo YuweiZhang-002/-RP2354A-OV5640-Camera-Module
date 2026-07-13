@@ -22,13 +22,25 @@ This project is a bare-metal Raspberry Pi Pico / RP2350 camera bridge for an OV5
 - 中文：设计参考以 `docs/DESIGN.md` 为准，当前代码优先保证采集、发送和时序控制的可维护性。
 - English: The design reference is `docs/DESIGN.md`, and the current code focuses on maintainable capture, output, and timing control.
 
-## Update (7/11) / 更新（7/11）
-
+## Update / 更新
+- (7/11)
 - 中文：今天整理并恢复了当前版本中的引脚与调试残留，FPGA 发送桥路回到 GPIO0-7 数据、GPIO8 时钟；临时调试逻辑已清理，采集停止函数也已补回。
 - English: Today’s cleanup restored the current pin mapping and removed debug leftovers. The FPGA bridge is back to GPIO0-7 for data and GPIO8 for clock; the temporary debug logic was removed, and the capture-stop function was restored.
 
 - 中文：同时保留了当前的双 DMA 发送机制，用来减少行与行之间的随机空档。
 - English: The current dual-DMA output mechanism was kept to reduce random gaps between lines.
+
+- (7/13)
+- 中文：预留给后续三天的修改记录，当前版本先保留这一段作为每天变更的落点。
+- English: Reserved for the next three days of change notes; this section is kept as a daily log anchor for upcoming updates.
+
+- (7/14)
+- 中文：预留。
+- English: Reserved.
+
+- (7/15)
+- 中文：预留。
+- English: Reserved.
 
 ## Build / 编译
 

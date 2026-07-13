@@ -55,6 +55,7 @@ add_executable(new_camera_project_app
 target_link_libraries(new_camera_project_app
     PRIVATE
         pico_stdlib
+    pico_multicore
         func
 )
 

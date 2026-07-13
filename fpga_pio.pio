@@ -1,4 +1,4 @@
-.program fpga_out
+.program packet_tx
 .side_set 1
 
 .define FPGA_DATA_PIN_BASE 0
@@ -19,22 +19,20 @@
 
 
 .wrap_target
-    out pins, 8         side 0   ; 先送出 8-bit 数据,时钟保持低电平
-    set pins, 1         side 0   ; GP20 先拉高，标记输出窗口开始
-    nop                 side 1   ; 再保持 1 个 clk cycle
-    set pins, 0         side 0   ; 过 2 个 clk cycles 后拉低 GP20
+    out pins, 8         side 1   ; 数据上线, STROBE=1
+    nop                 side 0   ; STROBE=0, 为下一字节做准备
 .wrap
 
 
 % c-sdk {
 #include "fpga_pio.h"
 
-static inline void fpga_out_program_init(PIO pio, uint sm, uint offset) {
-    pio_sm_config c = fpga_out_program_get_default_config(offset);
+static inline void packet_tx_program_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = packet_tx_program_get_default_config(offset);
     sm_config_set_out_pins(&c, FPGA_DATA_PIN_BASE, 8);    // D0'-D7' = GP0-7
     sm_config_set_sideset_pins(&c, FPGA_CLK_PIN);         // 时钟输出 = GP8
     sm_config_set_out_shift(&c, false, true, 8);
-    sm_config_set_clkdiv(&c, 1.5f);                       // 24MHz 字节时钟
+    sm_config_set_clkdiv(&c, 3.0f);                       // 144MHz/3=48MHz, 2 cycles/byte => 24MHz
     pio_sm_init(pio, sm, offset, &c);
 }
 %}

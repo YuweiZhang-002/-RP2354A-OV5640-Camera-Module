@@ -7,6 +7,7 @@ add_library(func STATIC
     timer.c
     cam_pio.c
     fpga_pio.c
+    image_process.c
 )
 
 target_include_directories(func PUBLIC

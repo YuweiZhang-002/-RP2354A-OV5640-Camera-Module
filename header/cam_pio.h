@@ -37,8 +37,9 @@
 #define CAM_DEBUG_PIN       9u   /* DMA 完成中断调试输出 */
 
 /* ── 每次 DMA 传输的字节数 / 字数 ────────────────────────────────────────────── */
-/* 当前分辨率 1280x720 Y8：一行 = 1280px x 1B = 1280B = 320 word = 一次 DMA。 */
-#define CAPTURE_BYTES        1280u
+/* 当前分辨率 640x480 Y8：一行 = 640px x 1B = 640B = 160 word = 一次 DMA。 */
+#define CAPTURE_BYTES         640u
+#define CAPTURE_LINES         480u
 #define CAPTURE_WORDS       (CAPTURE_BYTES / 4u)
 /* ── 行级三缓冲环 ─────────────────────────────────────────────────────────────
  * 采集 DMA 在 N 块行缓冲间循环写入：
@@ -47,7 +48,7 @@
  * 三块给一行的流水留出余量：采集不必等发送，发送也不会读到正在写的块。
  * 若消费者落后到环满，采集丢弃最新一行并累加 cam_overrun_count（不阻塞采集）。
  * ──────────────────────────────────────────────────────────────────────────*/
-#define CAM_NUM_BUFFERS      3u
+#define CAM_NUM_BUFFERS      8u
 
 /* ---------------------------------------------------------------------
  * 4x4-buffer (scaffold)
@@ -60,6 +61,7 @@
 #define CAPTURE_CHUNK_LINES  4u
 #define CAM_4X4_NUM_BUFFERS  4u
 
+
 /* 启用 4x4 scaffold（当前为预留实现，调用不会影响默认 3-buffer 行为） */
 void cam_enable_4x4_scaffold(void);
 
@@ -69,6 +71,15 @@ void cam_discard_next_frames(uint8_t frames);
 
 extern volatile uint8_t  frame_ready;       /* VSYNC 帧边界标记，供 IMU 按帧采样 */
 extern volatile uint32_t cam_overrun_count; /* 环满丢行计数（调试用） */
+
+
+/* 行计数器（用于滤波计算） */ 
+extern volatile uint32_t cam_linem1_count;
+extern volatile uint32_t cam_line0_count;     
+extern volatile uint32_t cam_linep1_count;
+extern volatile uint8_t  cam_filter_ready;        /* 采集链滤波计算就绪标记 */
+
+extern volatile uint32_t cam_line_count;   /* 采集帧计数（调试用） */
 
 /* ── 函数声明 ─────────────────────────────────────────────────────────────── */
 
@@ -86,6 +97,9 @@ void cam_capture_start(void);
 
 /* 关闭状态机并终止 DMA，清空 FIFO */
 void cam_capture_stop(void);
+
+/* 访问内部行缓冲，供图像处理层读取已采集的行 */
+const uint8_t *cam_get_buffer(uint32_t index);
 
 /* ── 采集/发送交接（消费者侧调用，通常在主循环）────────────────────────────────
  * cam_acquire_line(): 若有就绪行且上一行已归还，返回该行缓冲指针并标记为"在飞"；

@@ -19,12 +19,20 @@
  *   OV5640_Init()       — 寄存器配置（ov5640_set.c）
  */
 
+#include "pico/multicore.h"
 #include "pico/stdlib.h"
 #include "timer.h"
 #include "header/ov5640.h"
 #include "cam_pio.h"
 #include "ov5640_set.h"
 #include "fpga_pio.h"
+#include "image_process.h"
+
+#define PKT_PAYLOAD_SIZE  100u
+
+
+uint8_t packet_payload[PKT_PAYLOAD_SIZE];
+static uint8_t packet_buf[sizeof(pkt_row_header_t) + sizeof(pkt_row_payload_t) + sizeof(pkt_row_trailer_t)];
 
 
 /* 系统循环，用于强制终止出现ERROR的程序 */
@@ -34,16 +42,7 @@ void sys_loop(void)
 }
 
 
-/* */
-volatile bool work = false;
-
-/*
- * 注意：`FPGA_CTRL_PIN` 在设计语义上是一个由 FPGA/板上逻辑提供的
- * 输入信号，用以指示 OV5640 与采集/发送链的工作状态（例如：进入
- * 采集模式或停止）。该信号在当前开发阶段暂不使用——我们在
- * header/fpga_pio.h 中将其宏注释掉以避免误用。未来若需重新启用，
- * 可在此处添加基于该输入的启动/停止逻辑或其它策略。
- */
+static void fpga_pio_core1_entry(void);
 
 int main(void)
 {
@@ -69,41 +68,55 @@ int main(void)
     ov5640_i2c_init();
     ov5640_pin_init();
 
+    system_init_buffers();
+
     /* 唤醒窗口内的前 3 帧不参与后续处理 */
     cam_discard_next_frames(3u);
 
     /* 5. 传感器参数配置：若芯片 ID 或寄存器写入失败则直接停机 */
-    status = OV5640_Init(BMP_1280x720, OV5640_Y8, OV5640_Polarity_4);
+    status = OV5640_Init(BMP_640x480, OV5640_Y8, OV5640_Polarity_4);
     if (status != 0) {
         sys_loop();
     }
 
-    /* 当前是否有一行正在经 PIO1 发送（在飞） */
-    bool fpga_line_inflight = false;
+    multicore_launch_core1(fpga_pio_core1_entry); /* 启动 PIO1 发送核心 */
+
     /* 6. 启动连续采集（DMA+PIO0） */
     ov5640_start_capture(); 
 
     while (true) {
-        /* —— 发送链：与采集链解耦，仅通过 acquire/release 单点交接 —— */
+        if (cam_filter_ready) {
+            uint32_t row_idx = cam_line0_count;
+            uint32_t frame_idx = cam_line_count / CAPTURE_LINES;
+            cam_filter_ready = 0u; /* 清标记，等待下一行采集完成中断 */
+            process_frame_row(cam_get_buffer(cam_linem1_count),
+                              cam_get_buffer(cam_line0_count),
+                              cam_get_buffer(cam_linep1_count),
+                              row_idx);
+            multicore_fifo_push_blocking(row_idx);
 
-        /* 1) 上一行发送完成 → 归还缓冲，供采集复用 */
-        if (fpga_line_inflight && !fpga_dma_busy()) {
-            cam_release_line();
-            fpga_line_inflight = false;
-        }
-
-        /* 2) 空闲且有就绪行 → 启动一次 PIO1 发送 */
-        if (!fpga_line_inflight) {
-            uint8_t *line = cam_acquire_line();
-            if (line != NULL) {
-                fpga_tx_start(line);
-                fpga_line_inflight = true;
+            if ((cam_line_count % CAPTURE_LINES) == (CAPTURE_LINES - 1u)) {
+                update_threshold();
+                packet_send_meta(0u, 0u, 0u);
+                (void)frame_idx;
             }
         }
 
-        /*
-         * IMU 采样链已在当前设计中停用（imu.c 保留但不被 main 调用）。
-         * 若未来需要按帧边界采样，请在此处恢复调用。
-         */
+    }
+}
+
+
+/* ================= 核1: 帧时间域(软实时) ================= */
+static void fpga_pio_core1_entry(void)
+{
+    for (;;) {
+        uint32_t cur = multicore_fifo_pop_blocking();
+        const uint8_t *row_bits = image_get_row_bits(cur);
+        pkt_row_header_t *header = (pkt_row_header_t *)packet_buf;
+        pkt_row_payload_t *payload = (pkt_row_payload_t *)(packet_buf + sizeof(pkt_row_header_t));
+        pkt_row_trailer_t *trailer = (pkt_row_trailer_t *)(packet_buf + sizeof(pkt_row_header_t) + sizeof(pkt_row_payload_t));
+
+        packet_generator(row_bits, cur, (uint32_t)(cam_line_count / CAPTURE_LINES), header, payload, trailer);
+        fpga_tx_start(packet_buf, sizeof(packet_buf));
     }
 }
