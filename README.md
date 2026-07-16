@@ -42,6 +42,13 @@ This project is a bare-metal Raspberry Pi Pico / RP2350 camera bridge for an OV5
 - 中文：预留。
 - English: Reserved.
 
+- (7/16)
+- 中文：本轮把图像处理链进一步拆分为 Sobel 计算、Threshold 比对/写入和 Filter 打包三段，并把 GPIO9 探针切成独立窗口，方便分别观测各阶段耗时。
+- English: This round further split the image-processing chain into Sobel, Threshold compare/write, and Filter packing stages, and separated the GPIO9 probe windows so each phase can be timed independently.
+
+- 中文：同时把 Sobel 中间结果与二值化结果分离到不同的行缓冲中，Core 1 侧继续承担 XOR、参考帧更新和 packet 发送，便于后续按预算判断是否将 Threshold 整块迁移到 Core 1。
+- English: Sobel intermediates and binarized rows were also moved into separate line buffers, while Core 1 continues to handle XOR, reference-frame updates, and packet sending, making it easier to decide later whether Threshold should move wholesale to Core 1 based on timing budget.
+
 ## Build / 编译
 
 - 中文：在 VS Code 中可直接运行 `Compile Project` 任务，或使用当前 build 目录继续 Ninja 构建。

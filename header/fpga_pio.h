@@ -10,6 +10,8 @@
 #define FPGA_DATA_PIN_COUNT  8u
 #define FPGA_CLK_PIN         8u
 
+extern volatile bool fpga_tx_busy;
+
 void fpga_gpio_init(void);
 void fpga_pio_init(void);
 void fpga_dma_init(void);

@@ -66,8 +66,6 @@ volatile uint32_t cam_linem1_count   = 0u;
 volatile uint32_t cam_line0_count    = 0u;
 volatile uint32_t cam_linep1_count   = 0u;
 volatile uint8_t  cam_filter_ready   = 0u;
-volatile bool     dma_flag          = false;
-volatile bool     comp_flag         = false;
 static volatile uint8_t cam_warmup_discard_frames = 0u;
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -92,10 +90,6 @@ void cam_gpio_init(void)
     gpio_init(CAM_VSYNC_PIN);
     gpio_set_dir(CAM_VSYNC_PIN, GPIO_IN);
     gpio_set_pulls(CAM_VSYNC_PIN, true, false);
-
-    gpio_init(CAM_DEBUG_PIN);
-    gpio_set_dir(CAM_DEBUG_PIN, GPIO_OUT);
-    gpio_put(CAM_DEBUG_PIN, 0);
 
 }
 
@@ -151,7 +145,7 @@ static void cam_dma_irq_handler(void)
 
     cam_line_count = cam_prod_seq; /* 行计数 */
 
-    if (cam_prod_seq % CAPTURE_LINES > 2u) {
+    if (cam_prod_seq % CAPTURE_LINES > 2u && cam_prod_seq % CAPTURE_LINES < (CAPTURE_LINES - 1u)) {
         cam_linem1_count = (cam_prod_seq - 2u) % CAM_NUM_BUFFERS;    /* 采集链滤波计算行计数器 */
         cam_line0_count  = (cam_prod_seq - 1u) % CAM_NUM_BUFFERS;    /* 采集链滤波计算行计数器 */
         cam_linep1_count = cam_prod_seq % CAM_NUM_BUFFERS;           /* 采集链滤波计算行计数器 */
@@ -167,9 +161,6 @@ static void cam_dma_irq_handler(void)
         /* 发布刚写满的块（prod_seq 前进），重装到下一块继续采集。 */
         cam_prod_seq = next;
         cam_dma_rearm(cam_prod_seq % CAM_NUM_BUFFERS);
-        dma_flag = !dma_flag;
-        gpio_put(CAM_DEBUG_PIN, dma_flag);
-        
     }
 }
 
@@ -222,8 +213,6 @@ void cam_capture_start(void)
     cam_frame_count   = 0u;
     frame_ready       = 0u;
     cam_line_count    = 0u;
-    dma_flag          = false;
-    gpio_put(CAM_DEBUG_PIN, 0);
 
     /* 首块完整配置（设定读地址=RX FIFO，写地址=buf0，计数与触发）；
      * 之后的重装走 cam_dma_rearm() 快速路径。 */
@@ -293,7 +282,6 @@ void cam_release_line(void)
 static void cam_gpio_irq_callback(uint gpio, uint32_t events)
 {
     if (gpio == CAM_VSYNC_PIN && (events & GPIO_IRQ_EDGE_RISE)) {
-        comp_flag = false;
         cam_frame_count++;
     }
 
@@ -303,7 +291,6 @@ static void cam_gpio_irq_callback(uint gpio, uint32_t events)
             frame_ready = 0u;
             return;
         }
-        comp_flag = true;
         frame_ready = 1u;
     }
 }

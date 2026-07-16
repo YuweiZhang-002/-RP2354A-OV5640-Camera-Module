@@ -10,6 +10,8 @@ add_library(func STATIC
     image_process.c
 )
 
+target_compile_options(func PRIVATE -O3)
+
 target_include_directories(func PUBLIC
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/../header

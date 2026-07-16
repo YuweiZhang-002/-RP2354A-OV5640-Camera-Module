@@ -43,6 +43,8 @@ project(new_camera_project C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+
 pico_sdk_init()
 
 add_subdirectory(header)
@@ -51,6 +53,8 @@ add_subdirectory(func)
 add_executable(new_camera_project_app
     main.c
 )
+
+target_compile_options(new_camera_project_app PRIVATE -O3)
 
 target_link_libraries(new_camera_project_app
     PRIVATE
