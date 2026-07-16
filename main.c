@@ -27,8 +27,20 @@
 #include "ov5640_set.h"       /* OV5640 分辨率、格式、极性等配置入口 */
 #include "fpga_pio.h"         /* PIO1 + DMA 发送链路，负责把组包数据发出 */
 #include "image_process.h"    /* Sobel、XOR 矩、组包、阈值更新等图像处理接口 */
+#include "hardware/gpio.h"    /* GPIO9 探针：Core1 单行执行时间测量 */
 
 static uint8_t packet_buf[PACKET_BYTES];
+
+static void core1_timing_gpio_init(void)
+{
+    gpio_init(8u);
+    gpio_set_dir(8u, GPIO_OUT);
+    gpio_put(8u, 0);
+
+    gpio_init(9u);
+    gpio_set_dir(9u, GPIO_OUT);
+    gpio_put(9u, 0);
+}
 
 
 /* 系统循环，用于强制终止出现ERROR的程序 */
@@ -50,7 +62,7 @@ int main(void)
     /* 1. GPIO 复用与上拉/下拉初始化 */
     cam_gpio_init();
     fpga_gpio_init();
-    debug_gpio_init();
+    core1_timing_gpio_init();
 
     /* 2. PIO 程序和 DMA 初始化 */
     cam_pio_init();
@@ -103,6 +115,7 @@ int main(void)
      */
     while (true) {
         if (cam_filter_ready) {
+            gpio_put(9u, 1);
             uint32_t abs_row_idx = cam_line_count; /* 绝对行号：用于队列、丢行和消费计数 */
             uint32_t frame_row_idx = abs_row_idx % CAPTURE_LINES; /* 帧内行号：用于参考帧和包内行号 */
             cam_filter_ready = 0u; /* 清标记，等待下一行采集完成中断 */
@@ -111,7 +124,10 @@ int main(void)
                               cam_get_buffer(cam_linep1_count),
                               abs_row_idx);
             multicore_fifo_push_blocking(abs_row_idx);
-
+            if (frame_row_idx == (CAPTURE_LINES - 1u)) {
+                update_threshold();
+            }
+            gpio_put(9u, 0);
         }
 
     }
@@ -151,6 +167,9 @@ static void fpga_pio_core1_entry(void)
         bool has_overflow = (cam_overrun_count > last_overrun_count);
         last_overrun_count = cam_overrun_count;
 
+        gpio_put(8u, 1);
+
+
         /* Core 1 先更新参考帧，再把本行的控制位写进 packet header。 */
         image_core1_process_row(abs_row_idx, frame_row_idx, is_final_line);
 
@@ -166,5 +185,8 @@ static void fpga_pio_core1_entry(void)
 
         packet_generator(row_bits, frame_row_idx, frame_id, has_overflow, is_final_line, header, payload, trailer);
         fpga_tx_start(packet_buf, sizeof(packet_buf));
+
+        gpio_put(8u, 0);
+
     }
 }

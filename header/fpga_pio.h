@@ -8,7 +8,7 @@
 /* PIO1 packet output: 8 contiguous data pins + strobe */
 #define FPGA_DATA_PIN_BASE   0u
 #define FPGA_DATA_PIN_COUNT  8u
-#define FPGA_CLK_PIN         8u
+#define FPGA_CLK_PIN         23u   /* temporary: free GPIO8 for timing probe */
 
 extern volatile bool fpga_tx_busy;
 
