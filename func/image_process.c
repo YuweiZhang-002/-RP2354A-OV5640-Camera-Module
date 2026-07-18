@@ -36,6 +36,8 @@ static uint16_t prev_xc_q4 = 0;
 static uint16_t prev_yc_q4 = 0;
 static uint8_t prev_meta_valid = 0u;
 
+static void update_threshold(void);
+
 const uint32_t target = (uint32_t)((uint64_t)640 * 480 * 40000u / 1000000u);  /* = 12288 */
 
 
@@ -101,9 +103,9 @@ uint16_t crc16_ccitt(const void *d1, size_t n1, const void *d2, size_t n2, const
  * @param  sobel_pairs 输出的 Sobel 中间结果缓冲区，每个像素保存一组 (gx, gy) 打包值。
  * @param  width       图像宽度。
  * @note   作用：这是行级图像处理的第一段，只负责 Sobel 滑窗和梯度中间值生成。
- *         位置：在 fused_row_sq() 中先执行，用于后续 Threshold 阶段复用。
+ *         位置：fused_row_sq() 直接执行该 Sobel 阶段，结果供 Core 1 Threshold 阶段复用。
  */
-static void __attribute__((noinline))  __not_in_flash_func(threshold_row_sq)(const uint8_t *restrict r0, const uint8_t *restrict r1, const uint8_t *restrict r2,
+static void __attribute__((noinline))  __not_in_flash_func(fused_row_sq)(const uint8_t *restrict r0, const uint8_t *restrict r1, const uint8_t *restrict r2,
                   uint32_t *restrict sobel_pairs, int width)
 {    
     /* 指令③: 滑窗与梯度局部量统一 int32_t, 避免逐步 16 位截断(SXTH) */
@@ -220,12 +222,6 @@ static void __attribute__((noinline)) __not_in_flash_func(filter_pack_row_bits)(
     
 }
 
-static void __not_in_flash_func(fused_row_sq)(const uint8_t *restrict r0, const uint8_t *restrict r1, const uint8_t *restrict r2,
-                  uint32_t *restrict sobel_pairs, int width)
-{
-    threshold_row_sq(r0, r1, r2, sobel_pairs, width);   
-}
-
 /**
  * @brief  通过异或（XOR）操作计算两行之间的差异，并累加图像矩。
  * @note   作用：通过比较当前帧与参考帧的差异，快速计算出运动区域的面积和质心相关的矩。
@@ -277,28 +273,31 @@ size_t rle_encode_row(const uint8_t *bits, uint8_t *out, size_t max_len)
  * @note   作用：构建一个包含同步头、帧/行信息、数据载荷和 CRC 校验的标准化数据包。
  *         位置：在 core1 的发送循环中被调用，为每一行数据生成一个待发送的数据包。
  */
-void packet_generator(const uint8_t *row_bits, uint32_t row_idx, uint32_t frame_id_in, bool overflow, bool final_line,
+void packet_generator(const uint8_t *row_bits, uint32_t row_idx, uint32_t frame_id_in, bool overflow,
+                      bool first_line, bool final_line,
                       pkt_row_header_t *header, pkt_row_payload_t *payload, plt_row_trailer_t *trailer)
 {
     
     header->sync0 = 0xA5A5u;
     header->sync1 = 0x5A5Au;
+    header->cam_id = 0u;  /* 摄像头ID，当前版本固定为0 */
     header->frame_id = (uint16_t)frame_id_in;
     header->row_idx = (uint16_t)row_idx;
     header->row_flags = 0u;
     if (overflow) {
-        header->row_flags |= PKT_ROW_FLAG_OVERFLOW;  /* 仅保留行级溢出标志 */
+        header->row_flags |= PKT_ROW_FLAG_OVERFLOW;  /* 保留行级溢出标志 */
     }
     if (final_line) {
-        header->row_flags |= PKT_ROW_FLAG_FINAL_LINE; /* 仅保留帧尾标志 */
+        header->row_flags |= PKT_ROW_FLAG_FINAL_LINE; /* 保留帧尾标志 */
+    } else if (first_line) {
+        header->row_flags |= PKT_ROW_FLAG_FIRST_LINE; /* 保留帧首标志 */
     }
     header->payload_len = (uint8_t)ROW_BYTES;
     header->row_seq = row_seq++;
     memset(header->reserved, 0, sizeof(header->reserved));
 
     memcpy(payload->payload, row_bits, ROW_BYTES);
-    trailer->pad[0] = 0u;
-    trailer->pad[1] = 0u;
+     memset(trailer->pad, 0, sizeof(trailer->pad));
 
     trailer->m00 = frame_m00;
     if (frame_m00 > 0u) {
@@ -324,9 +323,12 @@ void packet_generator(const uint8_t *row_bits, uint32_t row_idx, uint32_t frame_
         trailer->vx_q8 = 0;
         trailer->vy_q8 = 0;
     }
-    trailer->crc16 = crc16_ccitt(header, sizeof(*header), 
-                                payload, sizeof(*payload), 
-                                trailer, sizeof(*trailer) - 2);
+    trailer->crc16 = 0xFFFFu;  /* CRC16 校验码暂时置为65535，FPGA端计算 */
+
+    /* trailer 已保存本帧统计量，此后再清零并更新下一帧阈值。 */
+    if (final_line) {
+        update_threshold();
+    }
     
 }
 
@@ -360,7 +362,7 @@ void process_frame_row(const uint8_t *r0, const uint8_t *r1, const uint8_t *r2, 
  * @note   作用：通过动态调整阈值 T_sq，使边缘检测算法能适应不同光照和场景复杂度，保持边缘点数量大致稳定。
  *         位置：在 main() 主循环中，每处理完一帧的最后一行时调用。
  */
-void update_threshold(void)
+static void update_threshold(void)
 {
     
     if (frame_edge_count > (target * 6u) / 5u) {
@@ -390,22 +392,26 @@ const uint8_t *image_get_row_bits(uint32_t row_idx)
 /**
  * @brief  (Core 1) 执行XOR和参考帧更新
  */
-void image_core1_process_row(uint32_t abs_row_idx, uint32_t frame_row_idx, bool is_final_line)
+void image_core1_process_row(uint32_t abs_row_idx, uint32_t frame_row_idx)
 {
-    const uint32_t *sobel_pairs = sobel_fifo[abs_row_idx % ROW_FIFO_DEPTH];
     uint8_t *bits = row_fifo[abs_row_idx % ROW_FIFO_DEPTH];
-    uint32_t edge_count = 0u;
 
-    filter_pack_row_bits(sobel_pairs, bits, T_sq, 640, &edge_count);
-    frame_edge_count += edge_count;
+    if ((frame_row_idx == 0u) || (frame_row_idx ==  1u)) {
+        /* 固定边界行不读取 sobel_fifo；80-byte payload 与参考行均置 0x00。 */
+        memset(bits, 0, ROW_BYTES);
+        memset(e_ref[frame_row_idx], 0, ROW_BYTES);
+    } else {
+        const uint32_t *sobel_pairs = sobel_fifo[abs_row_idx % ROW_FIFO_DEPTH];
+        uint32_t edge_count = 0u;
 
-    xor_row_moments(bits, e_ref[frame_row_idx], abs_row_idx, &frame_m00, &frame_m10, &frame_m01);
-    memcpy(e_ref[frame_row_idx], bits, ROW_BYTES);
+        filter_pack_row_bits(sobel_pairs, bits, T_sq, 640, &edge_count);
+        frame_edge_count += edge_count;
+
+        xor_row_moments(bits, e_ref[frame_row_idx], frame_row_idx,
+                        &frame_m00, &frame_m10, &frame_m01);
+        memcpy(e_ref[frame_row_idx], bits, ROW_BYTES);
+    }
 
     /* 推进消费计数器，通知 Core 0 该行对应的 sobel_fifo 槽位可以被重用 */
     sobel_fifo_consumed_count = abs_row_idx + 1;
-
-    if (is_final_line) {
-        update_threshold();
-    }
 }

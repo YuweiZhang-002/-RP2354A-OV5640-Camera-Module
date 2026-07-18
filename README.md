@@ -49,6 +49,19 @@ This project is a bare-metal Raspberry Pi Pico / RP2350 camera bridge for an OV5
 - 中文：同时把 Sobel 中间结果与二值化结果分离到不同的行缓冲中，Core 1 侧继续承担 XOR、参考帧更新和 packet 发送，便于后续按预算判断是否将 Threshold 整块迁移到 Core 1。
 - English: Sobel intermediates and binarized rows were also moved into separate line buffers, while Core 1 continues to handle XOR, reference-frame updates, and packet sending, making it easier to decide later whether Threshold should move wholesale to Core 1 based on timing budget.
 
+- (7/18)
+- 中文：采集启动改为由 PIO 在入口等待两个完整 VSYNC 周期，严格跳过用于稳定的第一帧，并从第二帧开始进入持续 HREF/PCLK 采样；进入运行循环后 VSYNC 不再控制采集。
+- English: Capture startup now waits through two complete VSYNC boundary pairs in PIO, strictly skipping the first stabilization frame and starting continuous HREF/PCLK sampling from the second frame; VSYNC no longer controls capture after the runtime loop begins.
+
+- 中文：行交接统一为 `cam_acquire_line()` / `cam_release_line()` 三行滑动窗口。每帧行 0、1 作为 80-byte `0x00` 白边发送，行 2…479 执行 Sobel、Threshold、XOR 和组包，输出保持完整 480 行。
+- English: Line ownership now uses the `cam_acquire_line()` / `cam_release_line()` three-line sliding window. Rows 0 and 1 are transmitted as 80-byte `0x00` borders, while rows 2 through 479 run Sobel, thresholding, XOR, and packet generation, preserving a complete 480-row output.
+
+- 中文：行包已固定为 24-byte header + 80-byte payload + 24-byte trailer，共 128 byte，并由静态断言约束布局；当前 CRC 字段固定写入 `0xFFFF`，等待 FPGA 侧计算。当前发送实现经源码确认是单 DMA，并由 `fpga_tx_busy` 串行保护共享 `packet_buf`。
+- English: The row packet is fixed at a 24-byte header, 80-byte payload, and 24-byte trailer (128 bytes total), with static assertions enforcing the layout. The CRC field is currently written as `0xFFFF` for FPGA-side calculation. Source review confirms that the current transmitter uses one DMA channel and serializes access to the shared `packet_buf` with `fpga_tx_busy`.
+
+- 中文：新增 `docs/img_struct_v6.md`，用 Mermaid 记录当前采集、双核处理、状态量所有权和 FPGA PIO 发送链，并明确列出仍需确认的帧边界、CRC、占位接口和调试配置。
+- English: Added `docs/img_struct_v6.md`, using Mermaid to document the current capture, dual-core processing, state ownership, and FPGA PIO transmit path, together with explicit open questions around frame boundaries, CRC, placeholder interfaces, and debug configuration.
+
 ## Build / 编译
 
 - 中文：在 VS Code 中可直接运行 `Compile Project` 任务，或使用当前 build 目录继续 Ninja 构建。

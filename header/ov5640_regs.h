@@ -764,7 +764,7 @@ static const sensor_reg_t ov5640_init_common[] = {
     {OV5640_TIMING_X_INC, 0x31},
     {OV5640_TIMING_Y_INC, 0x31},
     {OV5640_TIMING_HOFFSET_HIGH, 0x00},
-    {OV5640_TIMING_HOFFSET_LOW, 0x04},   // 改:8→4,按 720p 验证过的"总预留=2×offset"比例
+    {OV5640_TIMING_HOFFSET_LOW,  0x04},   // 改:8→4,按 720p 验证过的"总预留=2×offset"比例
     {OV5640_TIMING_VOFFSET_HIGH, 0x00},
     {OV5640_TIMING_VOFFSET_LOW, 0x02},   // 改:4→2,同上
     {OV5640_TIMING_HS_HIGH,     0x02},
@@ -779,25 +779,30 @@ static const sensor_reg_t ov5640_init_common[] = {
     {OV5640_TIMING_DVPHO_LOW,   0x80},   // 不变:640
     {OV5640_TIMING_DVPVO_HIGH,  0x01},
     {OV5640_TIMING_DVPVO_LOW,   0xE0},   // 不变:480
-    {OV5640_TIMING_HTS_HIGH,    0x07},
-    {OV5640_TIMING_HTS_LOW,     0x90},   // 按你的要求,不动
+    /* 12 MHz / (1562 clocks/line * 512 lines/frame) = 15.006 fps. */
+    {OV5640_TIMING_HTS_HIGH,    0x06},
+    {OV5640_TIMING_HTS_LOW,     0x1A},
     {OV5640_TIMING_VTS_HIGH,    0x02},
-    {OV5640_TIMING_VTS_LOW,     0x00},   // 按你的要求,不动
+    {OV5640_TIMING_VTS_LOW,     0x00},
+
+    /* Keep the AEC frame-length limits equal to VTS so that night-mode
+     * exposure cannot extend the frame period below the requested 15 fps. */
     {OV5640_AEC_CTRL02, 0x02},
-    {OV5640_AEC_CTRL03, 0xE0},
+    {OV5640_AEC_CTRL03, 0x00},
     {OV5640_AEC_MAX_EXPO_HIGH, 0x02},
-    {OV5640_AEC_MAX_EXPO_LOW, 0xE0},
-    {OV5640_AEC_CTRL0D, 0x04},
-    {OV5640_AEC_CTRL0E, 0x03},
+    {OV5640_AEC_MAX_EXPO_LOW, 0x00},
+    {OV5640_AEC_CTRL0D, 0x07}, /* floor((VTS - 4) / 64), 60 Hz bands */
+    {OV5640_AEC_CTRL0E, 0x06}, /* floor((VTS - 4) / 77), 50 Hz bands */
     {0x3618, 0x00},
     {0x3612, 0x29},
     {0x3708, 0x64},
     {0x3709, 0x52},
     {0x370c, 0x03},
-    {OV5640_AEC_B50_STEP_HIGH, 0x01},
-    {OV5640_AEC_B50_STEP_LOW, 0x27},
+    /* Anti-banding steps recalculated for PCLK=12 MHz and HTS=1562. */
+    {OV5640_AEC_B50_STEP_HIGH, 0x00},
+    {OV5640_AEC_B50_STEP_LOW, 0x4d},
     {OV5640_AEC_B60_STEP_HIGH, 0x00},
-    {OV5640_AEC_B60_STEP_LOW, 0xf6},
+    {OV5640_AEC_B60_STEP_LOW, 0x40},
     {OV5640_BLC_CTRL01, 0x02},
     {OV5640_BLC_CTRL04, 0x02},
     {OV5640_SYSREM_RESET00, 0x00},
@@ -991,61 +996,61 @@ static const sensor_reg_t ov5640_init_dvp[] = {
     {OV5640_MIPI_CONTROL00, 0x58},
     /* Timing configuration */
 
-    /* DVP-mode system / PLL configuration (parallel-output clock path) */
+    /* DVP-mode clock path, for the project's 24 MHz XCLK input.
+     * This is the copied 12 MHz PCLK PLL/divider setting. */
     {OV5640_SC_PLL_CONTRL0,      0x18},
     {OV5640_SC_PLL_CONTRL1,      0x41},
     {OV5640_SC_PLL_CONTRL2,      0x60},
-    {OV5640_SC_PLL_CONTRL3,      0x13},
+    {OV5640_SC_PLL_CONTRL3,      0x16}, /* ST OV5640_PCLK_12M setting */
     {OV5640_SYSTEM_ROOT_DIVIDER, 0x01},
 };
 
-/* 23) Resolution Adjustment 
- *     Registers that adjust the output resolution by changing the cropping and subsampling parameters. 
- *     These are applied on top of the base timing setup in ov5640_init
+/* 23) Uploaded 640x480 window mode
+ *
+ *     The complete crop/binning geometry is programmed by ov5640_init_common:
+ *       sensor crop : (664, 488) .. (1959, 1455) = 1296 x 968
+ *       increment   : X/Y = 0x31 (2x2 binning path)
+ *       ISP offset  : H = 4, V = 2
+ *       DVP output  : 640 x 480
+ *
+ *     Keep every public resolution selector on that uploaded mode.  In
+ *     particular, do not overwrite 0x3810..0x3813 here: the former VGA table
+ *     changed H offset to 336 and V offset to 124 after common init, which
+ *     displaced the valid window and reduced the observed active-line ratio.
  */
-
-// HD720 minimal (only set output window). Timing (HTS/VTS) kept in init_common.
 static const sensor_reg_t ov5640_svga_regs[] = {
-    {OV5640_TIMING_DVPHO_HIGH, 0x05},
-    {OV5640_TIMING_DVPHO_LOW,  0x00},
-    {OV5640_TIMING_DVPVO_HIGH, 0x02},
-    {OV5640_TIMING_DVPVO_LOW,  0xD0},
-};
-
-// WVGA(800*480) 
-static const sensor_reg_t ov5640_wvga_regs[] = {
-    {OV5640_TIMING_DVPHO_HIGH, 0x03},
-    {OV5640_TIMING_DVPHO_LOW, 0x20},
+    {OV5640_TIMING_DVPHO_HIGH, 0x02},
+    {OV5640_TIMING_DVPHO_LOW,  0x80},
     {OV5640_TIMING_DVPVO_HIGH, 0x01},
-    {OV5640_TIMING_DVPVO_LOW, 0xE0},
+    {OV5640_TIMING_DVPVO_LOW,  0xE0},
 };
 
-// 800x600
+static const sensor_reg_t ov5640_wvga_regs[] = {
+    {OV5640_TIMING_DVPHO_HIGH, 0x02},
+    {OV5640_TIMING_DVPHO_LOW,  0x80},
+    {OV5640_TIMING_DVPVO_HIGH, 0x01},
+    {OV5640_TIMING_DVPVO_LOW,  0xE0},
+};
+
 static const sensor_reg_t ov5640_800x600_regs[] = {
-  {OV5640_TIMING_DVPHO_HIGH, 0x03},
-  {OV5640_TIMING_DVPHO_LOW,  0x20},
-  {OV5640_TIMING_DVPVO_HIGH, 0x02},
-  {OV5640_TIMING_DVPVO_LOW,  0x58},
+    {OV5640_TIMING_DVPHO_HIGH, 0x02},
+    {OV5640_TIMING_DVPHO_LOW,  0x80},
+    {OV5640_TIMING_DVPVO_HIGH, 0x01},
+    {OV5640_TIMING_DVPVO_LOW,  0xE0},
 };
 
-// VGA(640*480)  
 static const sensor_reg_t ov5640_vga_regs[] = {
     {OV5640_TIMING_DVPHO_HIGH, 0x02},
-    {OV5640_TIMING_DVPHO_LOW, 0x80},
+    {OV5640_TIMING_DVPHO_LOW,  0x80},
     {OV5640_TIMING_DVPVO_HIGH, 0x01},
-    {OV5640_TIMING_DVPVO_LOW, 0xE0},
-  {OV5640_TIMING_HOFFSET_HIGH, 0x01},
-  {OV5640_TIMING_HOFFSET_LOW,  0x50},
-  {OV5640_TIMING_VOFFSET_HIGH, 0x00},
-  {OV5640_TIMING_VOFFSET_LOW,  0x7C},
+    {OV5640_TIMING_DVPVO_LOW,  0xE0},
 };
 
-// QVGA(320*240)
 static const sensor_reg_t ov5640_qvga_regs[] = {
-    {OV5640_TIMING_DVPHO_HIGH, 0x01},
-    {OV5640_TIMING_DVPHO_LOW, 0x40},
-    {OV5640_TIMING_DVPVO_HIGH, 0x00},
-    {OV5640_TIMING_DVPVO_LOW, 0xF0},
+    {OV5640_TIMING_DVPHO_HIGH, 0x02},
+    {OV5640_TIMING_DVPHO_LOW,  0x80},
+    {OV5640_TIMING_DVPVO_HIGH, 0x01},
+    {OV5640_TIMING_DVPVO_LOW,  0xE0},
 };
 
 

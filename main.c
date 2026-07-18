@@ -78,9 +78,6 @@ int main(void)
 
     system_init_buffers();
 
-    /* 唤醒窗口内的前 3 帧不参与后续处理 */
-    cam_discard_next_frames(3u);
-
     /* 5. 传感器参数配置：若芯片 ID 或寄存器写入失败则直接停机 */
     status = OV5640_Init(BMP_640x480, OV5640_Y8, OV5640_Polarity_4);
     if (status != 0) {
@@ -97,9 +94,9 @@ int main(void)
      *  主循环 (Core 0): 图像处理与任务分发
      * ===================================================================
      *
-     * 1. 等待标志 `cam_filter_ready`:
-     *    - 此标志由 `cam_pio.c` 中的 DMA 完成中断置位，表示新的一行原始数据已采集完成，
-     *      并且形成了可供 3x3 卷积计算的 "上-中-下" 三行数据。
+     * 1. 调用 `cam_acquire_line()`:
+     *    - DMA 完成中断发布一个可用的 p1 绝对行号；接口返回 true 时，已经形成
+     *      可供 3x3 卷积计算的 "上-中-下" 三行数据。
      *
      * 2. 执行 `process_frame_row()`:
      *    - 从行级三缓冲环中获取上、中、下三行原始数据。
@@ -109,25 +106,30 @@ int main(void)
      * 3. 跨核通信 `multicore_fifo_push_blocking()`:
      *    - 将处理完成的行号（在行 FIFO 中的索引）推送到核间 FIFO，通知 Core 1 可以发送这一行了。
      *
-     * 4. 帧尾处理:
-     *    - 当一帧的最后一行处理完毕时 (cam_line_count % CAPTURE_LINES == CAPTURE_LINES - 1)，
-     *      调用 `update_threshold()` 根据本帧的边缘总数调整下一帧的阈值。
-     */
+     * 4. 阈值更新:
+     *    - Core 1 完成当前帧最后一条实际发布行后，根据本帧边缘总数更新阈值。
+    */
     while (true) {
-        if (cam_filter_ready) {
-            gpio_put(9u, 1);
-            uint32_t abs_row_idx = cam_line_count; /* 绝对行号：用于队列、丢行和消费计数 */
-            uint32_t frame_row_idx = abs_row_idx % CAPTURE_LINES; /* 帧内行号：用于参考帧和包内行号 */
-            cam_filter_ready = 0u; /* 清标记，等待下一行采集完成中断 */
-            process_frame_row(cam_get_buffer(cam_linem1_count),
-                              cam_get_buffer(cam_line0_count),
-                              cam_get_buffer(cam_linep1_count),
-                              abs_row_idx);
-            multicore_fifo_push_blocking(abs_row_idx);
-            if (frame_row_idx == (CAPTURE_LINES - 1u)) {
-                update_threshold();
+        uint32_t p1_abs_row_idx;
+        if (cam_line_ready){
+            if (cam_acquire_line(&p1_abs_row_idx)) {
+                gpio_put(9u, 1);
+
+                process_frame_row(cam_get_buffer(p1_abs_row_idx - 2u),
+                                cam_get_buffer(p1_abs_row_idx - 1u),
+                                cam_get_buffer(p1_abs_row_idx),
+                                p1_abs_row_idx);
+                cam_release_line();
+
+                /* p1=2 时先发布两个全零行，此后发布 p1 本身：
+                 * 每帧固定为 0、1(全零)，2..479(Sobel/Threshold)。 */
+                if ((p1_abs_row_idx % CAPTURE_LINES) == 2u) {
+                    multicore_fifo_push_blocking(p1_abs_row_idx - 2u);
+                    multicore_fifo_push_blocking(p1_abs_row_idx - 1u);
+                }
+                multicore_fifo_push_blocking(p1_abs_row_idx);
+                gpio_put(9u, 0);
             }
-            gpio_put(9u, 0);
         }
 
     }
@@ -163,6 +165,7 @@ static void fpga_pio_core1_entry(void)
         uint32_t abs_row_idx = multicore_fifo_pop_blocking();
         uint32_t frame_row_idx = abs_row_idx % CAPTURE_LINES;
         uint32_t frame_id = abs_row_idx / CAPTURE_LINES;
+        bool is_first_line = (frame_row_idx == 2u);
         bool is_final_line = frame_row_idx == (CAPTURE_LINES - 1u);
         bool has_overflow = (cam_overrun_count > last_overrun_count);
         last_overrun_count = cam_overrun_count;
@@ -171,7 +174,7 @@ static void fpga_pio_core1_entry(void)
 
 
         /* Core 1 先更新参考帧，再把本行的控制位写进 packet header。 */
-        image_core1_process_row(abs_row_idx, frame_row_idx, is_final_line);
+        image_core1_process_row(abs_row_idx, frame_row_idx);
 
         const uint8_t *row_bits = image_get_row_bits(abs_row_idx);
         pkt_row_header_t *header = (pkt_row_header_t *)packet_buf;
@@ -183,7 +186,7 @@ static void fpga_pio_core1_entry(void)
             tight_loop_contents();
         }
 
-        packet_generator(row_bits, frame_row_idx, frame_id, has_overflow, is_final_line, header, payload, trailer);
+        packet_generator(row_bits, frame_row_idx, frame_id, has_overflow, is_first_line, is_final_line, header, payload, trailer);
         fpga_tx_start(packet_buf, sizeof(packet_buf));
 
         gpio_put(8u, 0);

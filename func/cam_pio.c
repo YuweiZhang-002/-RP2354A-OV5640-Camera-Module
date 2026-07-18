@@ -10,7 +10,7 @@
  *     ▼  写满一行 (CAPTURE_BYTES) → DMA 完成中断
  *   完成中断：把该块标记为"就绪"，立即重装到环里下一块（无忙等、无旧 HSTX 调用）
  *     ▼
- *   主循环 cam_acquire_line() 取走就绪块 → PIO1 发送 → cam_release_line() 归还
+ *   Core 0 主循环 cam_acquire_line() 认领三行窗口 → Sobel → cam_release_line() 归还旧行
  *
  * 关键设计：
  *   - 采集层只生产 + 打标记，不直接驱动发送层（解耦）。
@@ -25,6 +25,7 @@
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
+#include "hardware/sync.h"
 
 #include "cam_pio.h"
 #include "cam_pio.pio.h"
@@ -35,6 +36,7 @@
  * ──────────────────────────────────────────────────────────────────────────*/
 static PIO  cam_pio      = pio0;
 static uint cam_sm       = 0u;
+static uint cam_program_offset = 0u;
 static int  cam_dma_chan = -1;
 static dma_channel_config cam_dma_cfg;
 
@@ -47,9 +49,9 @@ static uint8_t cam_frame_buf[CAM_NUM_BUFFERS][CAPTURE_BYTES];
 /*
  * 用三个单调递增序号描述生产/消费进度（无符号差值在回绕下仍成立）：
  *   cam_prod_seq — 已写满的行数；DMA 当前写入 cam_frame_buf[prod % N]
- *   cam_send_seq — 已派发给 PIO1 的行数；发送中的块下标 = (send-1) % N
- *   cam_cons_seq — 已发送完成并归还的行数
- * 不变式：cam_cons_seq <= cam_send_seq <= cam_prod_seq，且 send-cons <= 1（单条在飞）。
+ *   cam_send_seq — Core 0 当前窗口处理完成后可发布的消费位置
+ *   cam_cons_seq — 已发布给 DMA IRQ 的消费位置
+ * 不变式：cam_cons_seq == cam_send_seq 表示没有窗口在处理。
  *
  * 写者：prod 仅 DMA 中断写；send/cons 仅消费者（主循环）写。
  * 32-bit 对齐读写在 Cortex-M33 上原子，跨上下文无需加锁。
@@ -61,12 +63,9 @@ static volatile uint32_t cam_cons_seq = 0u;
 volatile uint8_t  frame_ready       = 0u;
 volatile uint32_t cam_overrun_count = 0u;
 volatile uint32_t cam_frame_count   = 0u;
-volatile uint32_t cam_line_count    = 0u;
-volatile uint32_t cam_linem1_count   = 0u;
-volatile uint32_t cam_line0_count    = 0u;
-volatile uint32_t cam_linep1_count   = 0u;
-volatile uint8_t  cam_filter_ready   = 0u;
-static volatile uint8_t cam_warmup_discard_frames = 0u;
+volatile bool     cam_line_ready    = false;
+static volatile uint32_t cam_filter_p1_idx = 0u;
+static volatile uint8_t  cam_filter_ready  = 0u;
 
 /* ────────────────────────────────────────────────────────────────────────────
  *  GPIO 初始化
@@ -98,7 +97,7 @@ void cam_gpio_init(void)
  * ──────────────────────────────────────────────────────────────────────────*/
 void cam_pio_init(void)
 {
-    uint offset = pio_add_program(cam_pio, &cam_capture_program);
+    cam_program_offset = pio_add_program(cam_pio, &cam_capture_program);
 
     for (uint i = 0u; i < CAM_DATA_PIN_COUNT; ++i) {
         pio_gpio_init(cam_pio, CAM_DATA_PIN_BASE + i);
@@ -113,7 +112,7 @@ void cam_pio_init(void)
     pio_sm_set_consecutive_pindirs(cam_pio, cam_sm, CAM_HREF_PIN,  1u, false);
     pio_sm_set_consecutive_pindirs(cam_pio, cam_sm, CAM_VSYNC_PIN, 1u, false);
 
-    cam_capture_program_init(cam_pio, cam_sm, offset);
+    cam_capture_program_init(cam_pio, cam_sm, cam_program_offset);
 
     pio_sm_set_enabled(cam_pio, cam_sm, false);
 }
@@ -143,22 +142,23 @@ static void cam_dma_irq_handler(void)
     }
     dma_channel_acknowledge_irq0((uint)cam_dma_chan);
 
-    cam_line_count = cam_prod_seq; /* 行计数 */
-
-    if (cam_prod_seq % CAPTURE_LINES > 2u && cam_prod_seq % CAPTURE_LINES < (CAPTURE_LINES - 1u)) {
-        cam_linem1_count = (cam_prod_seq - 2u) % CAM_NUM_BUFFERS;    /* 采集链滤波计算行计数器 */
-        cam_line0_count  = (cam_prod_seq - 1u) % CAM_NUM_BUFFERS;    /* 采集链滤波计算行计数器 */
-        cam_linep1_count = cam_prod_seq % CAM_NUM_BUFFERS;           /* 采集链滤波计算行计数器 */
-        cam_filter_ready = 1u;                                       /* 采集链滤波计算就绪标记 */
-    }
+    /* p1 帧内序号 2..479 可构成窗口 [p1-2,p1-1,p1]。只有确认采集环
+     * 仍有空间后才发布该窗口，避免把即将被重写的槽标记为可处理。 */
+    uint32_t p1_frame_idx = cam_prod_seq % CAPTURE_LINES;
     uint32_t next = cam_prod_seq + 1u;
 
     if ((next - cam_cons_seq) >= CAM_NUM_BUFFERS) {
         /* 环满：下一块仍被下游占用。丢弃刚采到的这一行，重写同一块。 */
         cam_overrun_count++;
+        /* 保留此前尚未认领的 ready 状态，使 Core 0 仍可消费旧窗口并释放空间。 */
         cam_dma_rearm(cam_prod_seq % CAM_NUM_BUFFERS);
     } else {
         /* 发布刚写满的块（prod_seq 前进），重装到下一块继续采集。 */
+        if (p1_frame_idx >= 2u) {
+            cam_filter_p1_idx = cam_prod_seq;
+            cam_filter_ready = 1u;
+            cam_line_ready = true;
+        }
         cam_prod_seq = next;
         cam_dma_rearm(cam_prod_seq % CAM_NUM_BUFFERS);
     }
@@ -187,8 +187,7 @@ void cam_dma_init(void)
                            PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
     irq_set_enabled(DMA_IRQ_0, true);
 
-    /* VSYNC 作为帧边界事件：仅做轻量记账与帧就绪标记。
-     * 注意：HREF 不参与 CPU 交接，数据流仍由 PIO + DMA 负责。 */
+    /* CPU侧VSYNC IRQ只做帧边界记账；采集启动和DMA重装均不由该IRQ控制。 */
     gpio_set_irq_enabled_with_callback(CAM_VSYNC_PIN,
                                        GPIO_IRQ_EDGE_RISE,
                                        true,
@@ -197,7 +196,7 @@ void cam_dma_init(void)
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
- *  启动采集
+ *  启动采集：PIO在入口跳过第一帧，从第二帧开始连续运行
  * ──────────────────────────────────────────────────────────────────────────*/
 void cam_capture_start(void)
 {
@@ -212,10 +211,21 @@ void cam_capture_start(void)
     cam_overrun_count = 0u;
     cam_frame_count   = 0u;
     frame_ready       = 0u;
-    cam_line_count    = 0u;
+    cam_line_ready    = false;
+    cam_filter_p1_idx = 0u;
+    cam_filter_ready  = 0u;
 
-    /* 首块完整配置（设定读地址=RX FIFO，写地址=buf0，计数与触发）；
-     * 之后的重装走 cam_dma_rearm() 快速路径。 */
+    /* 清除旧状态并把PC拉回程序入口。入口用两组VSYNC边界跳过第一帧；
+     * 进入wrap后不再读取VSYNC，仅由HREF/PCLK连续驱动，与V1运行方式相同。 */
+    pio_sm_set_enabled(cam_pio, cam_sm, false);
+    dma_channel_abort((uint)cam_dma_chan);
+    pio_sm_clear_fifos(cam_pio, cam_sm);
+    pio_sm_restart(cam_pio, cam_sm);
+    pio_sm_exec(cam_pio, cam_sm, pio_encode_jmp(cam_program_offset));
+
+    if (dma_channel_get_irq0_status((uint)cam_dma_chan)) {
+        dma_channel_acknowledge_irq0((uint)cam_dma_chan);
+    }
     dma_channel_configure(
         (uint)cam_dma_chan,
         &cam_dma_cfg,
@@ -225,12 +235,6 @@ void cam_capture_start(void)
         true);
 
     pio_sm_set_enabled(cam_pio, cam_sm, true);
-}
-
-void cam_discard_next_frames(uint8_t frames)
-{
-    cam_warmup_discard_frames = frames;
-    frame_ready = 0u;
 }
 
 const uint8_t *cam_get_buffer(uint32_t index)
@@ -255,29 +259,44 @@ void cam_capture_stop(void)
 /* ────────────────────────────────────────────────────────────────────────────
  *  采集/发送单点交接（消费者侧）
  * ──────────────────────────────────────────────────────────────────────────*/
-uint8_t *cam_acquire_line(void)
+bool cam_acquire_line(uint32_t *p1_abs_row_idx)
 {
-    if (cam_send_seq != cam_cons_seq) {
-        return NULL;                       /* 还有一行在飞，等其归还 */
-    }
-    if (cam_prod_seq == cam_send_seq) {
-        return NULL;                       /* 没有就绪行 */
+    if (p1_abs_row_idx == NULL) {
+        return false;
     }
 
-    uint8_t *buf = cam_frame_buf[cam_send_seq % CAM_NUM_BUFFERS];
-    cam_send_seq++;                        /* 标记为在飞 */
-    return buf;
+    uint32_t irq_state = save_and_disable_interrupts();
+    if (cam_send_seq != cam_cons_seq) {
+        restore_interrupts(irq_state);
+        return false;                      /* 上一个窗口尚未归还 */
+    }
+    if (cam_filter_ready == 0u) {
+        cam_line_ready = false;
+        restore_interrupts(irq_state);
+        return false;                      /* 尚未形成新的三行窗口 */
+    }
+
+    uint32_t p1_idx = cam_filter_p1_idx;
+    cam_send_seq = p1_idx - 1u;
+    cam_filter_ready = 0u;
+    cam_line_ready = false;
+    restore_interrupts(irq_state);
+
+    *p1_abs_row_idx = p1_idx;
+    return true;
 }
 
 void cam_release_line(void)
 {
     if (cam_send_seq != cam_cons_seq) {
-        cam_cons_seq++;                    /* 归还在飞缓冲，供采集复用 */
+        /* 原始窗口读取必须先完成，再允许 DMA IRQ 复用 p-2 及更早的行。 */
+        __dmb();
+        cam_cons_seq = cam_send_seq;
     }
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
- *  GPIO 中断回调：仅处理 VSYNC 帧边界（轻量标记）
+ *  GPIO 中断回调：仅做边界记账，不参与采集启动或PIO/DMA控制
  * ──────────────────────────────────────────────────────────────────────────*/
 static void cam_gpio_irq_callback(uint gpio, uint32_t events)
 {
@@ -286,11 +305,6 @@ static void cam_gpio_irq_callback(uint gpio, uint32_t events)
     }
 
     if (gpio == CAM_VSYNC_PIN && (events & GPIO_IRQ_EDGE_FALL)) {
-        if (cam_warmup_discard_frames > 0u) {
-            cam_warmup_discard_frames--;
-            frame_ready = 0u;
-            return;
-        }
         frame_ready = 1u;
     }
 }
