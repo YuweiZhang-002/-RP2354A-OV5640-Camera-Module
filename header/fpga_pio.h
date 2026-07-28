@@ -5,10 +5,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* PIO1 packet output: 8 contiguous data pins + strobe */
+/* PIO1 packet output: GPIO0-7 data, GPIO8 PCLK, GPIO9 packet HREF. */
 #define FPGA_DATA_PIN_BASE   0u
 #define FPGA_DATA_PIN_COUNT  8u
-#define FPGA_CLK_PIN         23u   /* temporary: free GPIO8 for timing probe */
+#define FPGA_CLK_PIN         8u   /* PIO1 side-set: 12 MHz byte clock */
+#define FPGA_HREF_PIN        9u   /* SIO output: high for one 128-byte packet */
 
 extern volatile bool fpga_tx_busy;
 

@@ -34,7 +34,7 @@
 #define CAM_PCLK_PIN        11u
 #define CAM_HREF_PIN        20u
 #define CAM_VSYNC_PIN       10u
-#define CAM_DEBUG_PIN       9u   /* DMA 完成中断调试输出 */
+#define CAM_DEBUG_PIN       9u   /* 旧调试别名；GPIO9现由FPGA_HREF使用，采集链不得驱动 */
 
 /* ── 每次 DMA 传输的字节数 / 字数 ────────────────────────────────────────────── */
 /* 当前分辨率 640x480 Y8：一行 = 640px x 1B = 640B = 160 word = 一次 DMA。 */

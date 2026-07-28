@@ -23,6 +23,14 @@
     wait 1 gpio VSYNC
     wait 0 gpio VSYNC
 
+    ; 等待第二帧结束，在第三帧起点开始连续采集。
+    wait 1 gpio VSYNC
+    wait 0 gpio VSYNC
+
+    ; 等待第三帧结束，在第四帧起点开始连续采集。
+    wait 1 gpio VSYNC
+    wait 0 gpio VSYNC
+
 .wrap_target
 line_loop:
     wait 1 gpio HREF

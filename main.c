@@ -2,8 +2,8 @@
  * main.c  —  RP2354 PIO 摄像头采集最小 Demo
  *
  * 完整数据流（单向闭合）：
- *   GPIO 0-7/8/10/9 → PIO 状态机 → RX FIFO → DMA → 行级三缓冲环
- *     → 主循环 cam_acquire_line() → PIO1 发送 → cam_release_line()
+ *   OV5640 GPIO12-19/11/20/10 → PIO0 → DMA → 行缓冲 → Core0/Core1
+ *     → PIO1 → FPGA GPIO0-7数据 / GPIO8 PCLK / GPIO9 HREF
  *
  * 三条链各管各的，主循环只做单点编排：
  *   - 采集链：PIO+DMA 在完成中断里自维持地逐行采集（cam_pio.c）
@@ -27,20 +27,8 @@
 #include "ov5640_set.h"       /* OV5640 分辨率、格式、极性等配置入口 */
 #include "fpga_pio.h"         /* PIO1 + DMA 发送链路，负责把组包数据发出 */
 #include "image_process.h"    /* Sobel、XOR 矩、组包、阈值更新等图像处理接口 */
-#include "hardware/gpio.h"    /* GPIO9 探针：Core1 单行执行时间测量 */
 
 static uint8_t packet_buf[PACKET_BYTES];
-
-static void core1_timing_gpio_init(void)
-{
-    gpio_init(8u);
-    gpio_set_dir(8u, GPIO_OUT);
-    gpio_put(8u, 0);
-
-    gpio_init(9u);
-    gpio_set_dir(9u, GPIO_OUT);
-    gpio_put(9u, 0);
-}
 
 
 /* 系统循环，用于强制终止出现ERROR的程序 */
@@ -62,7 +50,6 @@ int main(void)
     /* 1. GPIO 复用与上拉/下拉初始化 */
     cam_gpio_init();
     fpga_gpio_init();
-    core1_timing_gpio_init();
 
     /* 2. PIO 程序和 DMA 初始化 */
     cam_pio_init();
@@ -113,8 +100,6 @@ int main(void)
         uint32_t p1_abs_row_idx;
         if (cam_line_ready){
             if (cam_acquire_line(&p1_abs_row_idx)) {
-                gpio_put(9u, 1);
-
                 process_frame_row(cam_get_buffer(p1_abs_row_idx - 2u),
                                 cam_get_buffer(p1_abs_row_idx - 1u),
                                 cam_get_buffer(p1_abs_row_idx),
@@ -128,7 +113,6 @@ int main(void)
                     multicore_fifo_push_blocking(p1_abs_row_idx - 1u);
                 }
                 multicore_fifo_push_blocking(p1_abs_row_idx);
-                gpio_put(9u, 0);
             }
         }
 
@@ -170,9 +154,6 @@ static void fpga_pio_core1_entry(void)
         bool has_overflow = (cam_overrun_count > last_overrun_count);
         last_overrun_count = cam_overrun_count;
 
-        gpio_put(8u, 1);
-
-
         /* Core 1 先更新参考帧，再把本行的控制位写进 packet header。 */
         image_core1_process_row(abs_row_idx, frame_row_idx);
 
@@ -188,8 +169,6 @@ static void fpga_pio_core1_entry(void)
 
         packet_generator(row_bits, frame_row_idx, frame_id, has_overflow, is_first_line, is_final_line, header, payload, trailer);
         fpga_tx_start(packet_buf, sizeof(packet_buf));
-
-        gpio_put(8u, 0);
 
     }
 }

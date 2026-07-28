@@ -5,7 +5,6 @@
 #include "pico.h"             /* Pico 统一入口：提供 __not_in_flash_func 与 CMSIS 内建 */
 #include "pico/stdlib.h"      /* Pico 基础类型与 __SMULBB / __SMLABB 等内建支持 */
 #include "cam_pio.h"          /* CAPTURE_BYTES / CAPTURE_LINES / 摄像头行参数 */
-#include "hardware/gpio.h"    /* GPIO9 拥堵调试脚 */
 
 /*
  * ===================================================================
@@ -38,14 +37,27 @@ static uint8_t prev_meta_valid = 0u;
 
 static void update_threshold(void);
 
+static inline uint16_t wire_u16(uint16_t value)
+{
+    return __builtin_bswap16(value);
+}
+
+static inline int16_t wire_s16(int16_t value)
+{
+    return (int16_t)__builtin_bswap16((uint16_t)value);
+}
+
+static inline uint32_t wire_u32(uint32_t value)
+{
+    return __builtin_bswap32(value);
+}
+
 const uint32_t target = (uint32_t)((uint64_t)640 * 480 * 40000u / 1000000u);  /* = 12288 */
 
 
 void debug_gpio_init(void)
 {
-    gpio_init(9u);
-    gpio_set_dir(9u, GPIO_OUT);
-    gpio_put(9u, 0);
+    /* GPIO8/9已固定为FPGA PCLK/HREF；保留接口但不再占用这两个引脚。 */
 }
 
 /**
@@ -278,11 +290,11 @@ void packet_generator(const uint8_t *row_bits, uint32_t row_idx, uint32_t frame_
                       pkt_row_header_t *header, pkt_row_payload_t *payload, plt_row_trailer_t *trailer)
 {
     
-    header->sync0 = 0xA5A5u;
-    header->sync1 = 0x5A5Au;
+    header->sync0 = wire_u16(0xA5A0u);
+    header->sync1 = wire_u16(0x5A50u);
     header->cam_id = 0u;  /* 摄像头ID，当前版本固定为0 */
-    header->frame_id = (uint16_t)frame_id_in;
-    header->row_idx = (uint16_t)row_idx;
+    header->frame_id = wire_u16((uint16_t)frame_id_in);
+    header->row_idx = wire_u16((uint16_t)row_idx);
     header->row_flags = 0u;
     if (overflow) {
         header->row_flags |= PKT_ROW_FLAG_OVERFLOW;  /* 保留行级溢出标志 */
@@ -293,37 +305,37 @@ void packet_generator(const uint8_t *row_bits, uint32_t row_idx, uint32_t frame_
         header->row_flags |= PKT_ROW_FLAG_FIRST_LINE; /* 保留帧首标志 */
     }
     header->payload_len = (uint8_t)ROW_BYTES;
-    header->row_seq = row_seq++;
+    header->row_seq = wire_u16(row_seq++);
     memset(header->reserved, 0, sizeof(header->reserved));
 
     memcpy(payload->payload, row_bits, ROW_BYTES);
      memset(trailer->pad, 0, sizeof(trailer->pad));
 
-    trailer->m00 = frame_m00;
+    trailer->m00 = wire_u32(frame_m00);
     if (frame_m00 > 0u) {
         uint16_t xc_q4 = (uint16_t)(((uint64_t)frame_m10 * 16u + (frame_m00 / 2u)) / frame_m00);
         uint16_t yc_q4 = (uint16_t)(((uint64_t)frame_m01 * 16u + (frame_m00 / 2u)) / frame_m00);
-        trailer->xc_q4 = xc_q4;
-        trailer->yc_q4 = yc_q4;
+        trailer->xc_q4 = wire_u16(xc_q4);
+        trailer->yc_q4 = wire_u16(yc_q4);
 
         if (prev_meta_valid != 0u) {
-            trailer->vx_q8 = (int16_t)(((int32_t)xc_q4 - (int32_t)prev_xc_q4) << 4);
-            trailer->vy_q8 = (int16_t)(((int32_t)yc_q4 - (int32_t)prev_yc_q4) << 4);
+            trailer->vx_q8 = wire_s16((int16_t)(((int32_t)xc_q4 - (int32_t)prev_xc_q4) << 4));
+            trailer->vy_q8 = wire_s16((int16_t)(((int32_t)yc_q4 - (int32_t)prev_yc_q4) << 4));
         } else {
-            trailer->vx_q8 = 0;
-            trailer->vy_q8 = 0;
+            trailer->vx_q8 = wire_s16(0);
+            trailer->vy_q8 = wire_s16(0);
             prev_meta_valid = 1u;
         }
 
         prev_xc_q4 = xc_q4;
         prev_yc_q4 = yc_q4;
     } else {
-        trailer->xc_q4 = 0u;
-        trailer->yc_q4 = 0u;
-        trailer->vx_q8 = 0;
-        trailer->vy_q8 = 0;
+        trailer->xc_q4 = wire_u16(0u);
+        trailer->yc_q4 = wire_u16(0u);
+        trailer->vx_q8 = wire_s16(0);
+        trailer->vy_q8 = wire_s16(0);
     }
-    trailer->crc16 = 0xFFFFu;  /* CRC16 校验码暂时置为65535，FPGA端计算 */
+    trailer->crc16 = wire_u16(0xFFFFu);  /* CRC16 校验码暂时置为65535，FPGA端计算 */
 
     /* trailer 已保存本帧统计量，此后再清零并更新下一帧阈值。 */
     if (final_line) {
