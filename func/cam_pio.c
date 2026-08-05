@@ -196,7 +196,7 @@ void cam_dma_init(void)
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
- *  启动采集：PIO在入口跳过第一帧，从第二帧开始连续运行
+ *  启动采集：清空状态并把 PIO 拉回入口；前三帧跳过由 PIO 入口等待完成
  * ──────────────────────────────────────────────────────────────────────────*/
 void cam_capture_start(void)
 {
@@ -215,8 +215,8 @@ void cam_capture_start(void)
     cam_filter_p1_idx = 0u;
     cam_filter_ready  = 0u;
 
-    /* 清除旧状态并把PC拉回程序入口。入口用两组VSYNC边界跳过第一帧；
-     * 进入wrap后不再读取VSYNC，仅由HREF/PCLK连续驱动，与V1运行方式相同。 */
+    /* 清除旧状态并把PC拉回程序入口。是否正式开始采集由 PIO 入口的 VSYNC
+     * 等待序列控制；进入wrap后不再读取VSYNC，仅由HREF/PCLK连续驱动。 */
     pio_sm_set_enabled(cam_pio, cam_sm, false);
     dma_channel_abort((uint)cam_dma_chan);
     pio_sm_clear_fifos(cam_pio, cam_sm);
