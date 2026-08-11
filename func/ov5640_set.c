@@ -101,8 +101,6 @@ int32_t OV5640_SetPixelFormat(uint32_t PixelFormat)
 {
   const sensor_reg_t *regs;
   uint32_t count;
-  uint32_t i;
-
   switch (PixelFormat)
   {
     case OV5640_RGB565:

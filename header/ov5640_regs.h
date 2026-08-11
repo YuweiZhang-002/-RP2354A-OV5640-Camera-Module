@@ -780,8 +780,8 @@ static const sensor_reg_t ov5640_init_common[] = {
     {OV5640_TIMING_DVPVO_HIGH,  0x01},
     {OV5640_TIMING_DVPVO_LOW,   0xE0},   // 不变:480
     /* 12 MHz / (1562 clocks/line * 512 lines/frame) = 15.006 fps. */
-    {OV5640_TIMING_HTS_HIGH,    0x05},
-    {OV5640_TIMING_HTS_LOW,     0xB8},
+    {OV5640_TIMING_HTS_HIGH,    0x06},
+    {OV5640_TIMING_HTS_LOW,     0x1A},
     {OV5640_TIMING_VTS_HIGH,    0x02},
     {OV5640_TIMING_VTS_LOW,     0x00},
 

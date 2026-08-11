@@ -1,174 +1,491 @@
 /*
- * main.c  —  RP2354 PIO 摄像头采集最小 Demo
+ * RP2350A Camera pipeline
  *
- * 完整数据流（单向闭合）：
- *   OV5640 GPIO12-19/11/20/10 → PIO0 → DMA → 行缓冲 → Core0/Core1
- *     → PIO1 → FPGA GPIO0-7数据 / GPIO8 PCLK / GPIO9 HREF
+ * OV5640 -> PIO0/DMA -> physical line descriptors -> Core0 Sobel
+ *        -> Core1 threshold/bit pack -> 128-byte packet -> PIO1/FPGA
  *
- * 三条链各管各的，主循环只做单点编排：
- *   - 采集链：PIO+DMA 在完成中断里自维持地逐行采集（cam_pio.c）
- *   - 发送链：主循环把就绪行交给 PIO1 发送，互不在同一中断路径（fpga_pio.c）
- *   - IMU 链：按 VSYNC 帧边界(frame_ready)自采样、FIFO、串口外发（imu.c）
+ * 行节奏契约（本文件的核心不变量）：
+ *   完整物理帧按 row_idx=0..479 发出恰好480个job。采集侧为每个
+ *   HREF都发布描述符；payload丢失时同一行就地变成INVALID_ROW，仍是
+ *   “一个Camera HREF -> 一个FPGA行包”。
  *
- * 初始化职责分离：
- *   cam_gpio_init()     — 引脚方向/上拉（cam_pio.c）
- *   cam_pio_init()      — PIO 程序加载 + 行计数器预装（cam_pio.c）
- *   cam_dma_init()      — DMA 通道申请 + DREQ + 完成中断 + VSYNC 中断（cam_pio.c）
- *   ov5640_i2c_init()   — SCCB/I2C 总线初始化（ov5640.c）
- *   ov5640_pin_init()   — 上电时序（ov5640.c）
- *   OV5640_Init()       — 寄存器配置（ov5640_set.c）
+ *   严禁在FRAME_END无上限补到row479。实测2026-08-11_21-43-48.bin中
+ *   有31835个包的起始间隔小于20us：这是伪VSYNC在约308行关帧后，
+ *   无上限帧尾补齐一次生成约172个job的直接结果。现在只修复不超过3行的
+ *   局部描述符缺口；大缺口直接结束为INCOMPLETE，不制造发送突发。
  */
 
-#include "pico/multicore.h"   /* 双核 FIFO / core1 启动，用于 core0-core1 行号交接 */
-#include "pico/stdlib.h"      /* Pico 基础库：GPIO、sleep、stdio 初始化等通用接口 */
-#include "timer.h"            /* 项目自定义定时器与系统节拍初始化 */
-#include "header/ov5640.h"    /* OV5640 SCCB/I2C 读写、上电与启动采集接口 */
-#include "cam_pio.h"          /* PIO0 + DMA 摄像头采集链路与行缓冲状态 */
-#include "ov5640_set.h"       /* OV5640 分辨率、格式、极性等配置入口 */
-#include "fpga_pio.h"         /* PIO1 + DMA 发送链路，负责把组包数据发出 */
-#include "image_process.h"    /* Sobel、XOR 矩、组包、阈值更新等图像处理接口 */
+#include <string.h>
+
+#include "pico/multicore.h"
+#include "pico/stdlib.h"
+
+#include "timer.h"
+#include "header/ov5640.h"
+#include "cam_pio.h"
+#include "ov5640_set.h"
+#include "fpga_pio.h"
+#include "image_process.h"
+
+/* 一条已到达的原始行。ring 按 row_idx % 3 索引，构成真正的三行滑窗。 */
+typedef struct {
+    bool     valid;          /* payload 可用 */
+    uint16_t row_idx;
+    uint8_t  buffer_idx;
+    uint16_t error_flags;
+} core0_row_slot_t;
+
+typedef struct {
+    bool     active;
+    uint32_t frame_id;
+    uint16_t next_emit_row;      /* 下一个必须发出的行号 */
+    uint16_t expected_row;       /* 下一个期望到达的原始行号 */
+    uint16_t output_count;
+    uint16_t placeholder_rows;   /* 因数据缺失而占位的行数 */
+    uint16_t error_flags;
+    uint16_t last_rows_seen;
+    uint32_t last_descriptor_seq;
+    bool     has_last_job;
+    uint32_t last_job_seq;
+    core0_row_slot_t ring[3];
+} core0_frame_state_t;
 
 static uint8_t packet_buf[PACKET_BYTES];
+static core0_frame_state_t core0_frame;
+static uint32_t core1_last_tx_start_us = 0u;
+static volatile bool core1_tx_irq_ready = false;
 
-
-/* 系统循环，用于强制终止出现ERROR的程序 */
-void sys_loop(void)
-{
-    while(1);
-}
+/*
+ * 128 byte @12MHz字节率约10.67us。正常job由Camera仦约130.17us间隔
+ * 生成；100us只用来抑制局部两三个job同时就绪的短突发，仍保留约30%
+ * 的追赶余量。大批积压由上游禁止生成，不再靠提高发送速度掩盖。
+ */
+#define FPGA_TX_MIN_START_INTERVAL_US   100u
+#define CORE0_MAX_INLINE_REPAIR_ROWS      3u
 
 static void fpga_pio_core1_entry(void);
 
+void sys_loop(void)
+{
+    while (true) {
+        tight_loop_contents();
+    }
+}
+
+static inline void update_max(volatile uint32_t *maximum, uint32_t value)
+{
+    if (value > *maximum) {
+        *maximum = value;
+    }
+}
+
+static void core0_push_job(uint32_t job_seq)
+{
+    uint32_t start = time_us_32();
+    multicore_fifo_push_blocking(job_seq);
+    uint32_t elapsed = time_us_32() - start;
+    pipeline_timing_stats.core0_push_wait_last_us = elapsed;
+    update_max(&pipeline_timing_stats.core0_push_wait_max_us, elapsed);
+}
+
+static void core0_release_ring(void)
+{
+    for (uint8_t i = 0u; i < 3u; ++i) {
+        if (core0_frame.ring[i].valid) {
+            cam_release_buffer(core0_frame.ring[i].buffer_idx);
+        }
+        memset(&core0_frame.ring[i], 0, sizeof(core0_frame.ring[i]));
+    }
+}
+
+static void core0_start_frame(uint32_t frame_id)
+{
+    memset(&core0_frame, 0, sizeof(core0_frame));
+    core0_frame.active = true;
+    core0_frame.frame_id = frame_id;
+}
+
+static image_row_job_meta_t core0_make_job_meta(uint16_t row_idx,
+                                                uint16_t extra_error_flags)
+{
+    image_row_job_meta_t meta = {
+        .frame_id = core0_frame.frame_id,
+        .descriptor_seq = core0_frame.last_descriptor_seq,
+        .descriptor_overrun_count = cam_descriptor_overrun_count,
+        .capture_overrun_count = cam_overrun_count,
+        .row_idx = row_idx,
+        .physical_rows_seen = core0_frame.last_rows_seen,
+        .capture_error_flags =
+            (uint16_t)(core0_frame.error_flags | extra_error_flags),
+        .skip_done_count = (uint16_t)cam_skip_done_count,
+        .row_flags = (row_idx == 0u) ? PKT_ROW_FLAG_FIRST_LINE : 0u,
+        .has_sobel = 0u,
+        .job_type = IMAGE_JOB_ROW,
+        .frame_complete = 0u,
+    };
+    return meta;
+}
+
+/* 三行滑窗查询：row 必须到达过、payload 可用，且槽位仍属于该 row。 */
+static const core0_row_slot_t *core0_row_data(uint16_t row)
+{
+    if (row >= CAPTURE_LINES) {
+        return NULL;
+    }
+    const core0_row_slot_t *slot = &core0_frame.ring[row % 3u];
+    if (!slot->valid || slot->row_idx != row) {
+        return NULL;
+    }
+    return slot;
+}
+
+/*
+ * 发出行 row 的唯一出口。row 必须等于 next_emit_row，
+ * 因此行号只可能连续、单调、不重复。
+ */
+static void core0_emit_row(uint16_t row)
+{
+    const core0_row_slot_t *r0 = (row >= 2u)
+        ? core0_row_data((uint16_t)(row - 2u))
+        : NULL;
+    const core0_row_slot_t *r1 = (row >= 1u)
+        ? core0_row_data((uint16_t)(row - 1u))
+        : NULL;
+    const core0_row_slot_t *r2 = core0_row_data(row);
+
+    /* 恢复8月5日已验证的行语义：row0/1为零边界，row2..479使用
+     * [row-2,row-1,row]做Sobel。这里只改调度/标签，不改fused_row_sq数学实现。 */
+    bool boundary_row = row < 2u;
+    bool sobel_ok = !boundary_row && r0 != NULL && r1 != NULL && r2 != NULL;
+
+    uint16_t extra_err = 0u;
+    if (r2 != NULL) {
+        extra_err |= r2->error_flags;
+    }
+
+    image_row_job_meta_t meta = core0_make_job_meta(row, extra_err);
+    uint32_t job_seq;
+
+    if (sobel_ok) {
+        const uint8_t *p0 = cam_get_buffer(r0->buffer_idx);
+        const uint8_t *p1 = cam_get_buffer(r1->buffer_idx);
+        const uint8_t *p2 = cam_get_buffer(r2->buffer_idx);
+        job_seq = image_prepare_sobel_job(p0, p1, p2, &meta);
+        pipeline_timing_stats.core0_sobel_rows++;
+    } else {
+        if (!boundary_row) {
+            /* 行号保留、payload 缺失：显式标记，不静默跳号。 */
+            meta.row_flags |= PKT_ROW_FLAG_INVALID_ROW;
+            meta.capture_error_flags |= CAM_FRAME_ERR_ROW_JUMP;
+            core0_frame.placeholder_rows++;
+            core0_frame.error_flags |= CAM_FRAME_ERR_ROW_JUMP;
+            pipeline_timing_stats.core0_repair_rows++;
+        }
+        job_seq = image_prepare_zero_job(&meta);
+    }
+
+    core0_frame.last_job_seq = job_seq;
+    core0_frame.has_last_job = true;
+    core0_frame.output_count++;
+    core0_frame.next_emit_row = (uint16_t)(row + 1u);
+    pipeline_timing_stats.core0_row_jobs++;
+    core0_push_job(job_seq);
+}
+
+/* 只允许修复三行窗口可能造成的局部缺口。超过三行说明帧边界
+ * 或描述符流已经失步，继续补齐只会制造一批与Camera HREF无关的包。 */
+static bool core0_emit_rows_through(uint16_t last_row)
+{
+    if (last_row >= CAPTURE_LINES) {
+        last_row = (uint16_t)(CAPTURE_LINES - 1u);
+    }
+    if (core0_frame.next_emit_row > last_row) {
+        return true;
+    }
+    uint16_t count =
+        (uint16_t)(last_row - core0_frame.next_emit_row + 1u);
+    if (count > CORE0_MAX_INLINE_REPAIR_ROWS) {
+        core0_frame.error_flags |= CAM_FRAME_ERR_ROW_JUMP;
+        return false;
+    }
+    while (core0_frame.next_emit_row <= last_row) {
+        core0_emit_row(core0_frame.next_emit_row);
+    }
+    return true;
+}
+
+static void core0_store_row(const cam_descriptor_t *line)
+{
+    core0_row_slot_t *slot = &core0_frame.ring[line->row_idx % 3u];
+
+    /* 覆盖槽位前归还上一个占用者（row_idx - 3，已经发完）。 */
+    if (slot->valid) {
+        cam_release_buffer(slot->buffer_idx);
+    }
+
+    bool has_payload = (line->valid != 0u) && (line->buffer_idx < CAM_NUM_BUFFERS);
+    slot->valid = has_payload;
+    slot->row_idx = line->row_idx;
+    slot->buffer_idx = has_payload ? line->buffer_idx : CAM_INVALID_BUFFER;
+    slot->error_flags = line->error_flags;
+
+    if (!has_payload) {
+        cam_release_buffer(line->buffer_idx);
+    }
+}
+
+static bool core0_error_is_overflow(uint16_t error_flags)
+{
+    const uint16_t overflow_errors =
+        CAM_FRAME_ERR_DESC_QUEUE_FULL |
+        CAM_FRAME_ERR_DMA_OVERRUN |
+        CAM_FRAME_ERR_PIO_RXOVER |
+        CAM_FRAME_ERR_NO_BUFFER;
+    return (error_flags & overflow_errors) != 0u;
+}
+
+static void core0_finish_frame(uint32_t frame_id, uint16_t rows_seen,
+                               uint16_t capture_errors, bool capture_complete)
+{
+    if (!core0_frame.active) {
+        core0_start_frame(frame_id);
+    }
+    if (core0_frame.frame_id != frame_id) {
+        core0_frame.error_flags |= CAM_FRAME_ERR_BOUNDARY;
+    }
+
+    core0_frame.error_flags |= capture_errors;
+    core0_frame.last_rows_seen = rows_seen;
+
+    /* 走过正常row479描述符后next_emit_row已经是480，此处不生成job。
+     * 只有局部不超过3行的尾部描述符缺口才会占位；大缺口按
+     * INCOMPLETE收束，绝不在VSYNC中断中生成上百个job。 */
+    bool tail_emitted =
+        core0_emit_rows_through((uint16_t)(CAPTURE_LINES - 1u));
+
+    bool complete = tail_emitted && capture_complete &&
+                    core0_frame.error_flags == 0u &&
+                    rows_seen == CAPTURE_LINES &&
+                    core0_frame.placeholder_rows == 0u &&
+                    core0_frame.output_count == CAPTURE_LINES;
+
+    if (core0_frame.has_last_job) {
+        uint8_t flags = PKT_ROW_FLAG_FINAL_LINE;
+        if (!complete) {
+            flags |= PKT_ROW_FLAG_FRAME_INCOMPLETE;
+        }
+        if (core0_error_is_overflow(core0_frame.error_flags)) {
+            flags |= PKT_ROW_FLAG_OVERFLOW;
+        }
+        /* Core1 仍在 hold 这个 job，尚未组包，因此这里改 flags 是安全的。 */
+        image_finalize_job(core0_frame.last_job_seq, flags,
+                           rows_seen, core0_frame.error_flags);
+    }
+
+    image_row_job_meta_t end_meta =
+        core0_make_job_meta((uint16_t)(CAPTURE_LINES - 1u), 0u);
+    end_meta.row_flags = 0u;
+    end_meta.job_type = IMAGE_JOB_FRAME_END;
+    end_meta.frame_complete = complete ? 1u : 0u;
+    uint32_t end_job = image_prepare_frame_end_job(&end_meta);
+    core0_push_job(end_job);
+
+    core0_release_ring();
+    memset(&core0_frame, 0, sizeof(core0_frame));
+}
+
+static void core0_force_close_current_frame(void)
+{
+    if (!core0_frame.active) {
+        return;
+    }
+    core0_frame.error_flags |= CAM_FRAME_ERR_BOUNDARY;
+    core0_finish_frame(core0_frame.frame_id, core0_frame.last_rows_seen,
+                       CAM_FRAME_ERR_BOUNDARY, false);
+}
+
+static void core0_handle_line(const cam_descriptor_t *line)
+{
+    if (!core0_frame.active) {
+        core0_start_frame(line->frame_id);
+    } else if (line->frame_id != core0_frame.frame_id) {
+        /* 没有收到 FRAME_END 就来了新帧的行：先把旧帧走完再开新帧。 */
+        core0_force_close_current_frame();
+        core0_start_frame(line->frame_id);
+        core0_frame.error_flags |= CAM_FRAME_ERR_BOUNDARY;
+    }
+
+    if (line->row_idx >= CAPTURE_LINES) {
+        core0_frame.error_flags |= CAM_FRAME_ERR_TOO_MANY_ROWS | line->error_flags;
+        cam_release_buffer(line->buffer_idx);
+        return;
+    }
+
+    if (line->row_idx < core0_frame.expected_row) {
+        /* 行号必须单调；重复行只记错误，绝不回退已发出的行节奏。 */
+        core0_frame.error_flags |= CAM_FRAME_ERR_DUPLICATE_ROW;
+        cam_release_buffer(line->buffer_idx);
+        return;
+    }
+
+    if (line->row_idx > core0_frame.expected_row) {
+        core0_frame.error_flags |= CAM_FRAME_ERR_ROW_JUMP;
+    }
+    core0_frame.expected_row = (uint16_t)(line->row_idx + 1u);
+    core0_frame.last_rows_seen = line->rows_seen;
+    core0_frame.last_descriptor_seq = line->descriptor_seq;
+    /* 采集侧的错误在本物理帧内是粘性的，会带进后续所有行包的 metadata。 */
+    core0_frame.error_flags |= line->error_flags;
+
+    core0_store_row(line);
+
+    /* 8月5日语义中，收到row N后[row N-2,N-1,N]已完整，因此每个
+     * Camera行描述符恰好触发一个同行号job。row0/1是已知零边界。 */
+    (void)core0_emit_rows_through(line->row_idx);
+}
+
+static void core0_handle_descriptor(const cam_descriptor_t *descriptor)
+{
+    if (descriptor->type == CAM_DESC_LINE) {
+        core0_handle_line(descriptor);
+        return;
+    }
+
+    if (descriptor->type == CAM_DESC_FRAME_END) {
+        if (core0_frame.active && core0_frame.frame_id != descriptor->frame_id) {
+            core0_force_close_current_frame();
+        }
+        core0_finish_frame(descriptor->frame_id, descriptor->rows_seen,
+                           descriptor->error_flags, descriptor->valid != 0u);
+    }
+}
+
 int main(void)
 {
-    int status = 0;
-
-    /* 初始化 USB/UART 串口（用于调试打印） */
     timer_config();
     stdio_init_all();
 
-    /* 1. GPIO 复用与上拉/下拉初始化 */
     cam_gpio_init();
     fpga_gpio_init();
-
-    /* 2. PIO 程序和 DMA 初始化 */
     cam_pio_init();
     fpga_pio_init();
-
-    /* 3. DMA 通道申请与 DREQ 绑定，但不立即触发 */
     cam_dma_init();
     fpga_dma_init();
 
-    /* 4. OV5640 SCCB/I2C 与上电时序 */
     ov5640_i2c_init();
     ov5640_pin_init();
-
     system_init_buffers();
 
-    /* 5. 传感器参数配置：若芯片 ID 或寄存器写入失败则直接停机 */
-    status = OV5640_Init(BMP_640x480, OV5640_Y8, OV5640_Polarity_4);
+    int status = OV5640_Init(BMP_640x480, OV5640_Y8, OV5640_Polarity_4);
     if (status != 0) {
         sys_loop();
     }
 
-    multicore_launch_core1(fpga_pio_core1_entry); /* 启动 PIO1 发送核心 */
+    multicore_launch_core1(fpga_pio_core1_entry);
 
-    /* 6. 启动连续采集（DMA+PIO0） */
-    ov5640_start_capture(); 
+    /* 发送完成中断必须落在 Core1：它内部会自旋等待 PIO1 TXSTALL，
+     * 留在 Core0 会直接抢占 Sobel 与采集 DMA 的行交接。 */
+    while (!core1_tx_irq_ready) {
+        tight_loop_contents();
+    }
 
-    /*
-     * ===================================================================
-     *  主循环 (Core 0): 图像处理与任务分发
-     * ===================================================================
-     *
-     * 1. 调用 `cam_acquire_line()`:
-     *    - DMA 完成中断发布一个可用的 p1 绝对行号；接口返回 true 时，已经形成
-     *      可供 3x3 卷积计算的 "上-中-下" 三行数据。
-     *
-     * 2. 执行 `process_frame_row()`:
-     *    - 从行级三缓冲环中获取上、中、下三行原始数据。
-     *    - 对这三行数据进行 Sobel 边缘检测，生成二值化的边缘行。
-     *    - 将新生成的边缘行与参考帧（上一帧的边缘图）进行 XOR，计算运动目标的图像矩。
-     *
-     * 3. 跨核通信 `multicore_fifo_push_blocking()`:
-     *    - 将处理完成的行号（在行 FIFO 中的索引）推送到核间 FIFO，通知 Core 1 可以发送这一行了。
-     *
-     * 4. 阈值更新:
-     *    - Core 1 完成当前帧最后一条实际发布行后，根据本帧边缘总数更新阈值。
-    */
+    ov5640_start_capture();
+
     while (true) {
-        uint32_t p1_abs_row_idx;
-        if (cam_line_ready){
-            if (cam_acquire_line(&p1_abs_row_idx)) {
-                process_frame_row(cam_get_buffer(p1_abs_row_idx - 2u),
-                                cam_get_buffer(p1_abs_row_idx - 1u),
-                                cam_get_buffer(p1_abs_row_idx),
-                                p1_abs_row_idx);
-                cam_release_line();
-
-                /* p1=2 时先发布两个全零行，此后发布 p1 本身：
-                 * 每帧固定为 0、1(全零)，2..479(Sobel/Threshold)。 */
-                if ((p1_abs_row_idx % CAPTURE_LINES) == 2u) {
-                    multicore_fifo_push_blocking(p1_abs_row_idx - 2u);
-                    multicore_fifo_push_blocking(p1_abs_row_idx - 1u);
-                }
-                multicore_fifo_push_blocking(p1_abs_row_idx);
-            }
+        cam_descriptor_t descriptor;
+        if (!cam_descriptor_pop(&descriptor)) {
+            tight_loop_contents();
+            continue;
         }
 
+        uint32_t start = time_us_32();
+        core0_handle_descriptor(&descriptor);
+        uint32_t elapsed = time_us_32() - start;
+        pipeline_timing_stats.core0_service_last_us = elapsed;
+        update_max(&pipeline_timing_stats.core0_service_max_us, elapsed);
     }
 }
 
-
-/*
- * ===================================================================
- *  发送核心 (Core 1): 数据打包与 PIO 发送
- * ===================================================================
- *
- * 1. 等待数据 `multicore_fifo_pop_blocking()`:
- *    - 阻塞等待，直到 Core 0 向核间 FIFO 推送了新的行号。
- *
- * 2. 获取数据 `image_get_row_bits()`:
- *    - 使用收到的行号，从 `image_process.c` 的行 FIFO 中获取对应的二值化边缘行数据。
- *
- * 3. 打包数据 `packet_generator()`:
- *    - 将行数据、帧号、行号等信息填充到一个标准的数据包结构中，并计算 CRC。
- *
- * 4. 启动发送 `fpga_tx_start()`:
- *    - 将打包好的数据包交给 PIO1 的 DMA 通道，由硬件自动、高速地发送出去，发送期间 Core 1 不被阻塞。
- *
- * 5. Core 1 任务扩展:
- *    - 执行 `image_core1_process_row()`，进行 XOR 运算和参考帧 `e_ref` 的更新。
- *    - 在帧尾发送 `meta` 包。
- */
-static void fpga_pio_core1_entry(void)
+static void core1_send_job(uint32_t job_seq)
 {
-    uint32_t last_overrun_count = 0;
+    const image_row_job_meta_t *meta = image_get_job_meta(job_seq);
+    const uint8_t *row_bits = image_get_row_bits(job_seq);
+    pkt_row_header_t *header = (pkt_row_header_t *)packet_buf;
+    pkt_row_payload_t *payload =
+        (pkt_row_payload_t *)(packet_buf + sizeof(pkt_row_header_t));
+    plt_row_trailer_t *trailer =
+        (plt_row_trailer_t *)(packet_buf + sizeof(pkt_row_header_t) +
+                              sizeof(pkt_row_payload_t));
 
-    while (true) {
-        uint32_t abs_row_idx = multicore_fifo_pop_blocking();
-        uint32_t frame_row_idx = abs_row_idx % CAPTURE_LINES;
-        uint32_t frame_id = abs_row_idx / CAPTURE_LINES;
-        bool is_first_line = (frame_row_idx == 2u);
-        bool is_final_line = frame_row_idx == (CAPTURE_LINES - 1u);
-        bool has_overflow = (cam_overrun_count > last_overrun_count);
-        last_overrun_count = cam_overrun_count;
+    uint32_t wait_start = time_us_32();
+    while (fpga_dma_busy()) {
+        tight_loop_contents();
+    }
+    uint32_t fpga_wait_elapsed = time_us_32() - wait_start;
+    pipeline_timing_stats.core1_fpga_busy_wait_last_us = fpga_wait_elapsed;
+    update_max(&pipeline_timing_stats.core1_fpga_busy_wait_max_us,
+               fpga_wait_elapsed);
 
-        /* Core 1 先更新参考帧，再把本行的控制位写进 packet header。 */
-        image_core1_process_row(abs_row_idx, frame_row_idx);
-
-        const uint8_t *row_bits = image_get_row_bits(abs_row_idx);
-        pkt_row_header_t *header = (pkt_row_header_t *)packet_buf;
-        pkt_row_payload_t *payload = (pkt_row_payload_t *)(packet_buf + sizeof(pkt_row_header_t));
-        plt_row_trailer_t *trailer = (plt_row_trailer_t *)(packet_buf + sizeof(pkt_row_header_t) + sizeof(pkt_row_payload_t));
-        
-        /* 等待上一次 DMA 传输完成，确保 packet_buf 不会被覆盖 */
-        while (fpga_dma_busy()) {
+    uint32_t pacing_start = time_us_32();
+    if (core1_last_tx_start_us != 0u) {
+        while ((time_us_32() - core1_last_tx_start_us) <
+               FPGA_TX_MIN_START_INTERVAL_US) {
             tight_loop_contents();
         }
+    }
+    uint32_t pacing_elapsed = time_us_32() - pacing_start;
+    pipeline_timing_stats.core1_pacing_wait_last_us = pacing_elapsed;
+    update_max(&pipeline_timing_stats.core1_pacing_wait_max_us,
+               pacing_elapsed);
+    uint32_t wait_elapsed = time_us_32() - wait_start;
+    pipeline_timing_stats.core1_tx_wait_last_us = wait_elapsed;
+    update_max(&pipeline_timing_stats.core1_tx_wait_max_us, wait_elapsed);
 
-        packet_generator(row_bits, frame_row_idx, frame_id, has_overflow, is_first_line, is_final_line, header, payload, trailer);
-        fpga_tx_start(packet_buf, sizeof(packet_buf));
+    packet_generator(row_bits, meta, header, payload, trailer);
+    core1_last_tx_start_us = time_us_32();
+    fpga_tx_start(packet_buf, sizeof(packet_buf));
+    pipeline_timing_stats.core1_packets_sent++;
+    /* DMA读取的是packet_buf；组包完成后Sobel/row槽即可归还。 */
+    image_core1_release_job(job_seq);
+}
 
+static void fpga_pio_core1_entry(void)
+{
+    bool held_valid = false;
+    uint32_t held_job = 0u;
+
+    fpga_dma_irq_init_this_core();
+    __dmb();
+    core1_tx_irq_ready = true;
+
+    while (true) {
+        uint32_t job_seq = multicore_fifo_pop_blocking();
+        uint32_t start = time_us_32();
+        const image_row_job_meta_t *meta = image_get_job_meta(job_seq);
+
+        if (meta->job_type == IMAGE_JOB_FRAME_END) {
+            if (held_valid) {
+                core1_send_job(held_job);
+                held_valid = false;
+            }
+            image_core1_end_frame(meta->frame_complete != 0u);
+            image_core1_release_job(job_seq);
+        } else {
+            /*
+             * 上一行的 job 一直 hold 到下一个 job 到达才发送：这样 Core0
+             * 才有机会在帧尾把 FINAL_LINE / FRAME_INCOMPLETE 打到它上面。
+             */
+            if (held_valid) {
+                core1_send_job(held_job);
+            }
+            image_core1_process_job(job_seq);
+            pipeline_timing_stats.core1_row_jobs++;
+            held_job = job_seq;
+            held_valid = true;
+        }
+
+        uint32_t elapsed = time_us_32() - start;
+        pipeline_timing_stats.core1_service_last_us = elapsed;
+        update_max(&pipeline_timing_stats.core1_service_max_us, elapsed);
     }
 }

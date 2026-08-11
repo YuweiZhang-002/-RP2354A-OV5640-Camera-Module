@@ -16,6 +16,8 @@ extern volatile bool fpga_tx_busy;
 void fpga_gpio_init(void);
 void fpga_pio_init(void);
 void fpga_dma_init(void);
+/* 必须由实际发送数据的核（Core1）调用，安装并使能 DMA_IRQ_1。 */
+void fpga_dma_irq_init_this_core(void);
 void fpga_tx_start(const void *buffer, size_t length);
 bool fpga_dma_busy(void);
 void fpga_tx_stop(void);

@@ -79,13 +79,27 @@ void fpga_dma_init(void)
     channel_config_set_write_increment(&fpga_dma_cfg, false);
     channel_config_set_dreq(&fpga_dma_cfg, pio_get_dreq(fpga_pio, fpga_sm, true));
 
-    /* 行写满 → DMA 完成中断（DMA_IRQ_1），中断里清 busy 标志 */
+    /* 行写满 → DMA 完成中断（DMA_IRQ_1），中断里清 busy 标志。
+     * 通道级使能在这里做，NVIC 使能必须由将来处理它的核自己做，
+     * 见 fpga_dma_irq_init_this_core()。 */
     dma_channel_set_irq1_enabled((uint)fpga_dma_chan, true);
-    irq_set_exclusive_handler(DMA_IRQ_1, fpga_dma_irq_handler);
-    irq_set_enabled(DMA_IRQ_1, true);
 
     // 预配置DMA，但不启动
     dma_channel_configure((uint)fpga_dma_chan, &fpga_dma_cfg, &fpga_pio->txf[fpga_sm], NULL, 0, false);
+}
+
+/*
+ * 由 Core1 在进入发送循环前调用。
+ * irq_set_exclusive_handler()/irq_set_enabled() 只作用于调用核的向量表与
+ * NVIC，因此必须在 Core1 上执行：本 ISR 会自旋等待 PIO1 TXSTALL，
+ * 留在 Core0 上会直接抢占 Sobel 以及采集 DMA 的逐行交接。
+ */
+void fpga_dma_irq_init_this_core(void)
+{
+    irq_set_exclusive_handler(DMA_IRQ_1, fpga_dma_irq_handler);
+    /* 低于采集链(0x20)：FPGA 发送是可恢复的，摄像头行交接不可恢复。 */
+    irq_set_priority(DMA_IRQ_1, 0x80u);
+    irq_set_enabled(DMA_IRQ_1, true);
 }
 
 

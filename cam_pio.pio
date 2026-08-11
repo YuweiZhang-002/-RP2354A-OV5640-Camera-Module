@@ -5,42 +5,49 @@
 .define VSYNC 10
 
 ; ──────────────────────────────────────────────────────────────────────────
-; 摄像头采集程序 - 启动时跳过第一帧，运行期纯HREF/PCLK驱动
+; 摄像头采集程序 —— 只负责“按HREF采样640字节”，不再触碰VSYNC
 ;
-; 工作流程：
-;   1. 第一组VSYNC等待对齐第一帧起点，该帧用于传感器稳定且不采样
-;   2. 第二组VSYNC等待第一帧结束，并在第二帧起点进入采集循环
-;   3. 等待HREF拉高并按PCLK采集一行
-;   4. HREF拉低后返回行外层，等待下一行
-;   5. 两组等待都位于wrap_target之前，只在启动/重启时执行一次
+;   1. irq wait 0  通知CPU：状态机停在确定入口，DMA可以先arm
+;   2. CPU清IRQ0后进入行循环
+;   3. 每行：wait 0 HREF -> wait 1 HREF -> 精确采样 20x32 = 640 个PCLK
+;
+; 为什么行长度用计数而不用HREF电平：
+;   HREF的上升/下降沿与PCLK完全异步。用 `jmp pin` 在PCLK低电平后重读HREF
+;   会让行长度取决于亚周期相位，同一条物理行可能被采成639/640/641字节。
+;   实测参考(docs/2026-08-11_21-51-15.bin)：每条HREF高电平内恰好640个PCLK
+;   上升沿，7202/7202条无例外，且PCLK在消隐期不停。因此计数是严格正确的。
+;   采满后 `wait 0 gpio HREF` 重新对齐消隐区，任何尾部相位异常只影响当前行。
+;
+; 为什么VSYNC不再由PIO直接数边沿：
+;   `wait 1 gpio VSYNC` / `wait 0 gpio VSYNC` 会被10ns级毛刺满足。实测
+;   docs/2026-08-11_22-21-22.bin 在上电阶段包含多个10ns脉冲和一个
+;   1.033ms宽脉冲，稳态运行期也出现过10ns毛刺。
+;   CPU现在同时验证VSYNC高电平宽度、50~90ms周期以及周期内恰好
+;   480个HREF；只有连续三个完整的480行周期才会完成跳帧。
+;
+; 行尾不使用 `irq wait`：PIO在任何情况下都不等待CPU，
+; CPU中断延迟再大也不会让 `wait 0 gpio HREF` 吞掉一条已经开始的物理行。
 ; ──────────────────────────────────────────────────────────────────────────
 
-    ; 对齐第一帧起点，但不采集这一帧。
-    wait 1 gpio VSYNC
-    wait 0 gpio VSYNC
-
-    ; 等待第一帧结束，在第二帧起点开始连续采集。
-    wait 1 gpio VSYNC
-    wait 0 gpio VSYNC
-
-    ; 等待第二帧结束，在第三帧起点开始连续采集。
-    wait 1 gpio VSYNC
-    wait 0 gpio VSYNC
-
-    ; 等待第三帧结束，在第四帧起点开始连续采集。
-    wait 1 gpio VSYNC
-    wait 0 gpio VSYNC
+    ; DMA必须先arm。CPU清除IRQ0之前，PIO不会读取任何摄像头电平。
+    irq wait 0
 
 .wrap_target
 line_loop:
+    ; 每行都从消隐区重新对齐：先确认HREF已结束，再等待新行开始。
+    wait 0 gpio HREF
     wait 1 gpio HREF
 
+    ; 外层20次 x 内层32次 = 640字节，与DVPHO=640严格一致。
+    set y, 19
+outer_loop:
+    set x, 31
 byte_loop:
     wait 1 gpio PCLK
     in pins, 8
     wait 0 gpio PCLK
-    jmp pin, byte_loop
-    jmp line_loop
+    jmp x--, byte_loop
+    jmp y--, outer_loop
 .wrap
 
 
@@ -52,9 +59,11 @@ static inline void cam_capture_program_init(PIO pio, uint sm, uint offset)
     pio_sm_config c = cam_capture_program_get_default_config(offset);
 
     sm_config_set_in_pins(&c, CAM_DATA_PIN_BASE);
-    sm_config_set_jmp_pin(&c, CAM_HREF_PIN);
     sm_config_set_clkdiv(&c, 1.0f);
     sm_config_set_in_shift(&c, false, true, 8);
+    /* This state machine never transmits.  Joining both FIFO halves gives DMA
+     * eight bytes of RX elasticity instead of four during bus arbitration. */
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 
     pio_sm_init(pio, sm, offset, &c);
 }
