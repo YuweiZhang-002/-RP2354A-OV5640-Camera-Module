@@ -1,28 +1,25 @@
 /*
  * cam_pio.c — OV5640 PIO/DMA采集、物理帧边界与行描述符队列
  *
- * 权威关系：
- *   VSYNC falling edge -> 关闭上一帧并开始新physical frame
- *   PIO 640-byte 行     -> 物理行边界；PIO自己数满一个HREF的640个PCLK，
- *                          随后 wait 0 gpio HREF 重新对齐到消隐区
- *   DMA 640-byte完成   -> 该物理行边界的到达通知 + 数据buffer
+ * 权威关系（简单、单向、不可能死锁）：
+ *   VSYNC 合格下降沿 -> 无条件：发布FRAME_END、重置PIO/FIFO/DMA、
+ *                        行号归零、帧号递增
+ *   PIO 一条HREF      -> 无条件产出640字节（HREF提前结束就在PIO内补零），
+ *                        因此 一个HREF <=> 一次640-byte DMA完成
+ *   DMA 640-byte完成  -> 该物理行边界的到达通知 + 数据buffer
  *
- * 为什么行号可以由DMA块完成次数产生：
- *   cam_capture.pio 在每条HREF内精确采样640个PCLK，并且每行开头都用
- *   `wait 0 gpio HREF` / `wait 1 gpio HREF` 重新对齐。因此
- *       一个HREF  <=>  恰好640个采样字节  <=>  恰好一次640-byte DMA完成
- *   是PIO用硬件保证的恒等式，与HREF/PCLK之间的异步相位无关。
- *   行号仍然由“PIO确认的HREF行”定义，DMA只负责把这条边界和数据交给CPU。
+ * 固件不再在任何地方要求“必须凑满480行”：
+ *   之前的版本在VSYNC判定里要求 rows_seen==CAPTURE_LINES 才认边界，
+ *   于是只要出现一次短帧，之后所有边界都被拒绝，帧再也关不掉 —— 卡死。
+ *   现在帧是否满480行完全交给FPGA侧扫描判定，固件只负责无条件重新同步。
+ *   cam_line_end_count / cam_last_frame_diag.rows_seen 仅作为记录保留。
  *
  * CPU完全不在PIO的逐行关键路径上：
- *   - PIO行尾不再使用 `irq wait`，PIO永远不会等待CPU；
- *   - CPU中断延迟不会再让 `wait 0 gpio HREF` 吞掉一条已经开始的物理行；
- *   - 没有空闲buffer时该行落入drop buffer，行号照常推进，只是数据标记为缺失，
- *     绝不会让后一行顶替前一行的位置。
+ *   - PIO行尾不使用 `irq wait`，PIO永远不会等待CPU；
+ *   - CPU中断延迟不会让 `wait 0 gpio HREF` 吞掉一条已经开始的物理行；
+ *   - 没有空闲buffer时该行落入drop buffer，行号照常推进，只是数据标记为缺失。
  *   DMA ISR唯一的硬期限是“在下一条HREF开始前重装好下一个640-byte块”，
  *   在HTS=1562/PCLK=12MHz下有约76.8us的消隐窗口。
- *
- * 每次VSYNC都会关闭上一帧并清理PIO/FIFO/DMA的残留，错误不会跨帧传播。
  */
 
 #include <string.h>
@@ -62,9 +59,7 @@ static uint32_t cam_descriptor_seq = 0u;
 static volatile bool cam_runtime_enabled = false;
 static volatile bool cam_frame_active = false;
 static volatile bool cam_startup_pending = false;
-static volatile bool cam_startup_anchor_valid = false;
-static volatile uint8_t cam_startup_complete_frames = 0u;
-static volatile uint32_t cam_startup_rows_since_boundary = 0u;
+static volatile uint8_t cam_skip_boundaries_left = 0u;
 /* cam_begin_physical_frame()先递增再发布；UINT32_MAX保证首次有效帧为0。 */
 static volatile uint32_t cam_physical_frame_id = UINT32_MAX;
 static volatile uint16_t cam_physical_row_idx = 0u;
@@ -84,48 +79,41 @@ volatile uint32_t cam_dataless_row_count = 0u;
 volatile uint32_t cam_partial_line_count = 0u;
 volatile uint32_t cam_skip_done_count = 0u;
 volatile uint32_t cam_discarded_frame_count = 0u;
-volatile uint32_t cam_vsync_reject_count = 0u;
 volatile uint32_t cam_vsync_glitch_count = 0u;
-volatile uint32_t cam_vsync_period_error_count = 0u;
-volatile uint32_t cam_vsync_row_error_count = 0u;
+volatile uint32_t cam_short_line_count = 0u;
+volatile uint32_t cam_frame_rollover_count = 0u;
 volatile uint32_t cam_startup_error_count = 0u;
 volatile uint32_t cam_frame_count = 0u;
 volatile cam_frame_diag_t cam_last_frame_diag;
 
 /*
- * VSYNC 帧边界判定阈值 —— 全部来自实测的 OV5640 时序
- * (docs/2026-08-11_21-51-15.bin, HTS=1562 / VTS=512 / PCLK=12MHz)：
+ * 实测 OV5640 时序 (docs/2026-08-11_21-51-15.bin，HTS=1562/VTS=512/PCLK=12MHz)：
+ *   行周期 130.167us；HREF高 = 恰好640个PCLK；每两个真VSYNC下降沿之间恰好480行
+ *   VSYNC 高电平宽度 260.34us；周期 66.645ms
+ *   最后一条HREF下降 -> VSYNC下降 808.0us；VSYNC下降 -> 下一条HREF上升 3434.2us
  *
- *   行周期            130.167 us
- *   VSYNC 高电平宽度   260.34 us  (= 正好 2 个行周期)
- *   最后一条HREF下降 -> VSYNC下降   808.0 us
- *   VSYNC下降 -> 下一条HREF上升    3434.2 us
- *   VSYNC 周期        66.645 ms
- *
- * 为什么需要形状+周期+行数判定：
- *   docs/2026-08-11_22-21-22.bin 证明VSYNC会出现10ns毛刺和超宽脉冲，
- *   且毛刺不只存在于上电阶段。只看边沿数或只看最小周期都不足以
- *   证明它是一个完整帧。正常帧的最终权威条件是两个合格VSYNC之间
- *   恰好出现480次PIO/DMA行完成。
- *
- *   真沿的特征是“形状”，而不是“间隔”：
- *     判定1 高电平宽度必须≈260us —— 耦合尖峰(<1us)和FPGA包宽(10.67us)都远小于它
- *     判定2 距上一条物理行结束必须≥400us —— 真沿是808us，行内耦合沿≤130us
- *     判定3 周期必须落在[50,90]ms —— 真周期66.645ms
+ * 实测异常 (docs/2026-08-11_22-21-22.bin)：
+ *   VSYNC 10ns 脉冲 @985.651ms / 986.877ms / 3345.066ms（最后一个在稳态运行期）
+ *   VSYNC 1033.53us 超宽脉冲 @1002.363ms
+ *   176条异常HREF行，全部落在 805.4~991.5ms；1000ms之后23258行全为640 PCLK
  */
-#define CAM_VSYNC_HIGH_MIN_US        150u   /* 真值260.3us；>FPGA包宽10.7us一个量级 */
-#define CAM_VSYNC_HIGH_MAX_US        450u
-#define CAM_VSYNC_LINE_IDLE_MIN_US   400u   /* 真值808us；行内耦合沿≤130us */
-#define CAM_VSYNC_MIN_PERIOD_US    50000u   /* 真值66.645ms */
-#define CAM_VSYNC_MAX_PERIOD_US    90000u
-/* 连续验证并丢弃三个恰好包含480行的完整物理帧。 */
-#define CAM_STARTUP_SKIP_FRAMES        3u
-#define CAM_STARTUP_TIMEOUT_MS      3000u
+/* 真沿260.33us，13倍余量；只用来挡10ns级毛刺。 */
+#define CAM_VSYNC_HIGH_MIN_US         20u
+/* 第1个合格边界只做对齐，之后丢弃3个完整帧（等价8月5日的set x,2循环+对齐wait对）。 */
+#define CAM_STARTUP_SKIP_BOUNDARIES    4u
+/* 超时后强制起跑，绝不返回失败：4个边界约267ms，加上等第一个合格脉冲。 */
+#define CAM_STARTUP_TIMEOUT_MS      1000u
+/*
+ * 活性看门狗：VSYNC是唯一的帧边界权威，但如果它长时间一个都不合格，
+ * 行号会一路涨过CAPTURE_LINES，之后每条行都被丢弃 —— 表现为静默停摆。
+ * 行号到达该上限时在采集侧强制翻页（只做描述符记账，不碰PIO/DMA硬件），
+ * 保证数据流永远继续。正常帧永远碰不到它。
+ */
+#define CAM_FRAME_ROW_WATCHDOG      (CAPTURE_LINES * 2u)
 
 static volatile uint64_t cam_last_vsync_fall_us = 0u;
 static volatile uint64_t cam_vsync_rise_us = 0u;
 static volatile bool cam_vsync_rise_valid = false;
-static volatile uint64_t cam_last_line_end_us = 0u;
 
 static void cam_gpio_irq_callback(uint gpio, uint32_t events);
 static void cam_dma_irq_handler(void);
@@ -225,6 +213,7 @@ static void cam_reset_runtime_capture(void)
     pio_sm_clear_fifos(cam_pio, cam_sm);
     pio_sm_restart(cam_pio, cam_sm);
     (void)cam_take_pio_rxover();
+    pio_interrupt_clear(cam_pio, 1u);   /* 丢弃残留的补零标志 */
     pio_sm_exec(cam_pio, cam_sm,
                 pio_encode_jmp(cam_program_offset + cam_capture_wrap_target));
 
@@ -237,8 +226,21 @@ static void cam_reset_runtime_capture(void)
  * 行号在这里唯一地产生并推进；数据是否可用只影响描述符的valid/error_flags，
  * 绝不影响行号，也绝不允许后一行前移补位。
  */
+/*
+ * 只做描述符记账的强制翻页：发布FRAME_END、递增帧号、行号归零。
+ * 不触碰PIO/DMA硬件，因此可以安全地在采集DMA中断内调用
+ * （cam_reset_runtime_capture() 里的 dma_channel_abort() 会自旋等通道停止，
+ *  在自己的ISR里调用可能挂死）。
+ */
+static void cam_force_frame_rollover(void);
+
 static void cam_publish_physical_line(uint8_t buffer_idx, uint16_t error_flags)
 {
+    /* 活性保护：VSYNC长时间不合格时不允许无限累积行号。 */
+    if (cam_physical_row_idx >= CAM_FRAME_ROW_WATCHDOG) {
+        cam_force_frame_rollover();
+    }
+
     uint16_t row = cam_physical_row_idx;
 
     cam_physical_row_idx++;
@@ -246,7 +248,8 @@ static void cam_publish_physical_line(uint8_t buffer_idx, uint16_t error_flags)
     cam_line_end_count++;
 
     if (row >= CAPTURE_LINES) {
-        /* 传感器给出的HREF多于480条：只记录错误，不产生越界行描述符。 */
+        /* 本帧HREF多于480条：只记录错误，不产生越界行描述符。
+         * 帧是否够480行由FPGA侧扫描判定。 */
         cam_mark_frame_error(CAM_FRAME_ERR_TOO_MANY_ROWS);
         cam_href_error_count++;
         if (buffer_idx < CAM_NUM_BUFFERS) {
@@ -300,17 +303,9 @@ static void cam_publish_physical_line(uint8_t buffer_idx, uint16_t error_flags)
     }
 }
 
-static void cam_close_physical_frame(void)
+/* 发布本物理帧的FRAME_END并锁存诊断。纯描述符记账，不动硬件。 */
+static void cam_publish_frame_end(void)
 {
-    if (!cam_runtime_enabled || !cam_frame_active) {
-        return;
-    }
-
-    /* VSYNC时DMA必须正好停在块边界；否则说明有一条行只搬到一半。 */
-    if (cam_dma_chan >= 0 && cam_dma_remaining() != CAPTURE_BYTES) {
-        cam_partial_line_count++;
-        cam_mark_frame_error(CAM_FRAME_ERR_HREF_LENGTH | CAM_FRAME_ERR_BOUNDARY);
-    }
     cam_frame_error_flags |= cam_take_pio_rxover();
     if (cam_physical_rows_seen < CAPTURE_LINES) {
         cam_frame_error_flags |= CAM_FRAME_ERR_TOO_FEW_ROWS;
@@ -343,21 +338,31 @@ static void cam_close_physical_frame(void)
     /* 行描述符最多占用CAM_NUM_BUFFERS个buffer；队列额外预留
      * 两个帧边界位置，保证过载帧仍能发布FRAME_END。 */
     (void)cam_queue_push(&descriptor, true);
+}
+
+/*
+ * VSYNC 上的强制刷新：发布FRAME_END，然后把PIO/FIFO/DMA清回行循环入口。
+ * 在垂直消隐（VSYNC下降沿到下一条HREF约3.43ms）里执行，绝不会打断一条行。
+ */
+static void cam_close_physical_frame(void)
+{
+    if (!cam_runtime_enabled || !cam_frame_active) {
+        return;
+    }
+
+    /* DMA应当正好停在块边界；否则说明VSYNC落在一条行的中间。 */
+    if (cam_dma_chan >= 0 && cam_dma_remaining() != CAPTURE_BYTES) {
+        cam_partial_line_count++;
+        cam_mark_frame_error(CAM_FRAME_ERR_HREF_LENGTH | CAM_FRAME_ERR_BOUNDARY);
+    }
+
+    cam_publish_frame_end();
     cam_frame_active = false;
     cam_reset_runtime_capture();
 }
 
-static void cam_begin_physical_frame(void)
+static void cam_reset_frame_counters(void)
 {
-    if (!cam_runtime_enabled) {
-        return;
-    }
-
-    if (cam_frame_active) {
-        cam_frame_error_flags |= CAM_FRAME_ERR_BOUNDARY;
-        cam_close_physical_frame();
-    }
-
     cam_physical_frame_id++;
     cam_physical_row_idx = 0u;
     cam_physical_rows_seen = 0u;
@@ -371,6 +376,27 @@ static void cam_begin_physical_frame(void)
     if (cam_dma_target_idx == CAM_INVALID_BUFFER) {
         cam_mark_frame_error(CAM_FRAME_ERR_DMA_OVERRUN | CAM_FRAME_ERR_NO_BUFFER);
     }
+}
+
+static void cam_begin_physical_frame(void)
+{
+    if (!cam_runtime_enabled) {
+        return;
+    }
+    if (cam_frame_active) {
+        cam_frame_error_flags |= CAM_FRAME_ERR_BOUNDARY;
+        cam_close_physical_frame();
+    }
+    cam_reset_frame_counters();
+}
+
+/* 见声明处注释：活性看门狗用的纯记账翻页，不碰PIO/DMA。 */
+static void cam_force_frame_rollover(void)
+{
+    cam_frame_rollover_count++;
+    cam_frame_error_flags |= CAM_FRAME_ERR_BOUNDARY | CAM_FRAME_ERR_TOO_MANY_ROWS;
+    cam_publish_frame_end();
+    cam_reset_frame_counters();
 }
 
 void cam_gpio_init(void)
@@ -434,16 +460,17 @@ static void cam_service_dma_completion(void)
      */
     cam_arm_next_buffer();
 
-    /* 物理行结束时刻。VSYNC判定用它区分“真帧边界(距上一行808us)”
-     * 和“行内耦合伪沿(距上一行≤130us)”。启动丢帧期也必须维护。 */
-    cam_last_line_end_us = time_us_64();
-
     uint16_t line_err = cam_take_pio_rxover();
 
-    if (cam_startup_pending) {
-        /* 启动阶段不发布描述符，但必须统计每个候选VSYNC周期
-         * 内的实际HREF数。这是“完整帧”的最终证据。 */
-        cam_startup_rows_since_boundary++;
+    /*
+     * PIO在补零时置IRQ1。该标志只可能在刚刚完成的这个640-byte块
+     * 填充期间被置位（置位后PIO立刻去等下一条HREF），因此与行严格一一对应。
+     * 行号和块边界依然正确，只是该行尾部是补出来的0。
+     */
+    if (pio_interrupt_get(cam_pio, 1u)) {
+        pio_interrupt_clear(cam_pio, 1u);
+        line_err |= CAM_FRAME_ERR_HREF_LENGTH;
+        cam_short_line_count++;
     }
 
     if (!cam_runtime_enabled || !cam_frame_active) {
@@ -532,10 +559,9 @@ void cam_capture_start(void)
     cam_line_publish_count = 0u;
     cam_dataless_row_count = 0u;
     cam_partial_line_count = 0u;
-    cam_vsync_reject_count = 0u;
     cam_vsync_glitch_count = 0u;
-    cam_vsync_period_error_count = 0u;
-    cam_vsync_row_error_count = 0u;
+    cam_short_line_count = 0u;
+    cam_frame_rollover_count = 0u;
     cam_discarded_frame_count = 0u;
     cam_frame_count = 0u;
     memset((void *)&cam_last_frame_diag, 0, sizeof(cam_last_frame_diag));
@@ -554,13 +580,10 @@ void cam_capture_start(void)
     const uint32_t vsync_edges = GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL;
 
     cam_startup_pending = false;
-    cam_startup_anchor_valid = false;
-    cam_startup_complete_frames = 0u;
-    cam_startup_rows_since_boundary = 0u;
+    cam_skip_boundaries_left = 0u;
     cam_last_vsync_fall_us = 0u;
     cam_vsync_rise_us = 0u;
     cam_vsync_rise_valid = false;
-    cam_last_line_end_us = 0u;
 
     gpio_set_irq_enabled(CAM_VSYNC_PIN, vsync_edges, false);
     gpio_acknowledge_irq(CAM_VSYNC_PIN, vsync_edges);
@@ -570,6 +593,7 @@ void cam_capture_start(void)
     pio_sm_restart(cam_pio, cam_sm);
     pio_sm_exec(cam_pio, cam_sm, pio_encode_jmp(cam_program_offset));
     pio_interrupt_clear(cam_pio, 0u);
+    pio_interrupt_clear(cam_pio, 1u);
 
     if (dma_channel_get_irq0_status((uint)cam_dma_chan)) {
         dma_channel_acknowledge_irq0((uint)cam_dma_chan);
@@ -590,29 +614,34 @@ void cam_capture_start(void)
 
     /*
      * 启动丢帧由CPU完成，不再交给PIO的 wait 1/wait 0 gpio VSYNC ——
-     * 那两条指令会被几十ns的耦合毛刺满足，丢帧循环可能瞬间跑完。
+     * 那两条指令会被10ns毛刺满足，丢帧循环可能瞬间跑完（实测输出
+     * 曾从相机第4帧的第386行开始）。
      *
      * 放行PIO后它立刻开始按HREF采样，但 cam_runtime_enabled 仍为 false，
-     * 所以 cam_service_dma_completion() 只回收buffer、不发布任何描述符；
-     * 同时它会维护 cam_last_line_end_us，供VSYNC判定使用。
-     * 任意候选VSYNC脉冲只能建立一个anchor。只有后续周期同时满足
-     * 50~90ms且内含恰好480次DMA行完成，才算一个真正被丢弃的完整帧。
-     * 连续三帧通过后，当前边界才是physical frame 0的起点。
+     * 所以 cam_service_dma_completion() 只回收buffer、不发布任何描述符。
+     * 这段时间正好覆盖传感器上电的异常行窗口（实测805.4~991.5ms）。
      */
-    cam_startup_anchor_valid = false;
-    cam_startup_complete_frames = 0u;
-    cam_startup_rows_since_boundary = 0u;
+    cam_skip_boundaries_left = CAM_STARTUP_SKIP_BOUNDARIES;
     cam_startup_pending = true;
     __dmb();
     gpio_acknowledge_irq(CAM_VSYNC_PIN, vsync_edges);
     gpio_set_irq_enabled(CAM_VSYNC_PIN, vsync_edges, true);
     pio_interrupt_clear(cam_pio, 0u);
 
+    /*
+     * 超时不再返回失败：宁可从帧中间起跑（那一帧会被FPGA按480行判掉，
+     * 下一个真VSYNC自然重新同步），也绝不停掉采集造成整机停摆。
+     */
     absolute_time_t timeout = make_timeout_time_ms(CAM_STARTUP_TIMEOUT_MS);
     while (cam_startup_pending) {
         if (time_reached(timeout)) {
+            uint32_t irq_state = save_and_disable_interrupts();
             cam_startup_error_count++;
-            cam_capture_stop();
+            cam_skip_boundaries_left = 0u;
+            cam_startup_pending = false;
+            cam_runtime_enabled = true;
+            cam_begin_physical_frame();
+            restore_interrupts(irq_state);
             return;
         }
         tight_loop_contents();
@@ -678,89 +707,33 @@ void cam_release_buffer(uint8_t buffer_idx)
     restore_interrupts(irq_state);
 }
 
-/* 这里只判定脉冲“形状”。周期和480行数在调用者中判定，
- * 因为启动和运行期对失步的处理不同。 */
-static bool cam_vsync_fall_shape_is_genuine(uint64_t now_us)
+/*
+ * 唯一的VSYNC判定：高电平宽度必须 >= CAM_VSYNC_HIGH_MIN_US。
+ *
+ * 这条判定只为挡掉 10ns 级毛刺（实测 985.651 / 986.877 / 3345.066 ms 各一个）。
+ * 真沿恒为 260.33us，余量 13 倍。1033.53us 的超宽脉冲被当作真沿接受 ——
+ * 反正它的作用就是强制刷新，接受它比拒绝它更安全。
+ *
+ * 刻意不做的判定：不看周期、不看行数、不看行空闲时间。
+ * 任何"必须恰好480行才认边界"的条件都会在出现一次短帧后
+ * 永久拒绝所有后续边界，帧再也关不掉 —— 这就是之前卡死的机制。
+ * 帧是否够480行由FPGA侧扫描判定，固件只负责无条件重新同步。
+ */
+static bool cam_vsync_fall_is_genuine(uint64_t now_us)
 {
-    /* 10ns脉冲在100MHz抓包中只有1个sample；超宽异常脉冲约1.033ms。
-     * 两者都不可能通过150~450us的形状窗口。 */
     if (!cam_vsync_rise_valid) {
+        /* 没有配对的上升沿：使能时抓到半个脉冲，或毛刺的上升沿没被锁存。 */
         cam_vsync_glitch_count++;
         return false;
     }
+
     uint64_t high_us = now_us - cam_vsync_rise_us;
     cam_vsync_rise_valid = false;
-    if (high_us < CAM_VSYNC_HIGH_MIN_US || high_us > CAM_VSYNC_HIGH_MAX_US) {
+    if (high_us < CAM_VSYNC_HIGH_MIN_US) {
         cam_vsync_glitch_count++;
         return false;
     }
-
-    /* 真沿位于垂直消隐内，距上一条物理行结束约808us。 */
-    if (cam_last_line_end_us != 0u &&
-        (now_us - cam_last_line_end_us) < CAM_VSYNC_LINE_IDLE_MIN_US) {
-        cam_vsync_reject_count++;
-        return false;
-    }
-
     return true;
-}
-
-static bool cam_vsync_period_is_normal(uint64_t period_us)
-{
-    return period_us >= CAM_VSYNC_MIN_PERIOD_US &&
-           period_us <= CAM_VSYNC_MAX_PERIOD_US;
-}
-
-static void cam_startup_accept_boundary(uint64_t now_us)
-{
-    uint32_t rows = cam_startup_rows_since_boundary;
-    cam_startup_rows_since_boundary = 0u;
-
-    if (!cam_startup_anchor_valid) {
-        /* 单个形状合格脉冲只建立anchor，绝不消耗三帧计数。 */
-        cam_startup_anchor_valid = true;
-        cam_startup_complete_frames = 0u;
-        cam_discarded_frame_count = 0u;
-        cam_last_vsync_fall_us = now_us;
-        return;
-    }
-
-    uint64_t period_us = now_us - cam_last_vsync_fall_us;
-    bool complete_frame = cam_vsync_period_is_normal(period_us) &&
-                          rows == CAPTURE_LINES;
-    if (!complete_frame) {
-        if (!cam_vsync_period_is_normal(period_us)) {
-            cam_vsync_period_error_count++;
-        }
-        if (rows != CAPTURE_LINES) {
-            cam_vsync_row_error_count++;
-        }
-        /* 当前形状合格边界成为新anchor，三帧连续性重新计算。 */
-        cam_startup_complete_frames = 0u;
-        cam_discarded_frame_count = 0u;
-        cam_last_vsync_fall_us = now_us;
-        return;
-    }
-
-    cam_startup_complete_frames++;
-    cam_discarded_frame_count = cam_startup_complete_frames;
-    cam_last_vsync_fall_us = now_us;
-    if (cam_startup_complete_frames < CAM_STARTUP_SKIP_FRAMES) {
-        return;
-    }
-
-    /* 此刻正好位于第三个完整帧的结束边界，且距下一条HREF
-     * 约3.43ms。在消隐期清理丢帧期间的FIFO/DMA状态后再开启frame 0。 */
-    cam_startup_pending = false;
-    cam_reset_runtime_capture();
-    cam_pio_rxover_count = 0u;
-    cam_startup_error_count += (cam_overrun_count != 0u) ? 1u : 0u;
-    cam_overrun_count = 0u;
-    cam_descriptor_overrun_count = 0u;
-    cam_skip_done_count++;
-    __dmb();
-    cam_runtime_enabled = true;
-    cam_begin_physical_frame();
 }
 
 static void cam_gpio_irq_callback(uint gpio, uint32_t events)
@@ -772,7 +745,8 @@ static void cam_gpio_irq_callback(uint gpio, uint32_t events)
     uint64_t now_us = time_us_64();
 
     if ((events & GPIO_IRQ_EDGE_RISE) != 0u) {
-        /* 只记录候选上升沿；真假由随后的下降沿按高电平宽度裁定。 */
+        /* 每个上升沿都刷新时间戳：即使某个毛刺的下降沿没被锁存，
+         * 下一个真上升沿也会把状态带回正确值，不会长期失效。 */
         cam_vsync_rise_us = now_us;
         cam_vsync_rise_valid = true;
     }
@@ -783,37 +757,41 @@ static void cam_gpio_irq_callback(uint gpio, uint32_t events)
     if (!cam_runtime_enabled && !cam_startup_pending) {
         return;
     }
-    if (!cam_vsync_fall_shape_is_genuine(now_us)) {
+    if (!cam_vsync_fall_is_genuine(now_us)) {
         return;
-    }
-
-    if (cam_startup_pending) {
-        cam_startup_accept_boundary(now_us);
-        return;
-    }
-
-    uint64_t period_us = (cam_last_vsync_fall_us == 0u)
-        ? 0u
-        : (now_us - cam_last_vsync_fall_us);
-    if (cam_last_vsync_fall_us != 0u &&
-        period_us < CAM_VSYNC_MIN_PERIOD_US) {
-        cam_vsync_reject_count++;
-        return;
-    }
-
-    /* 运行期的真帧边界必须已经看到480个HREF。这一条直接阻止
-     * “第308行伪VSYNC提前关帧 -> 帧尾一次性补172行”的故障链。 */
-    if (cam_frame_active && cam_physical_rows_seen < CAPTURE_LINES) {
-        cam_vsync_row_error_count++;
-        cam_vsync_reject_count++;
-        return;
-    }
-    if (period_us > CAM_VSYNC_MAX_PERIOD_US) {
-        cam_vsync_period_error_count++;
     }
 
     cam_last_vsync_fall_us = now_us;
-    /* 一个falling边沿完成“关旧帧+开新帧”，rise只测脉宽不改idx。 */
+
+    if (cam_startup_pending) {
+        /*
+         * 启动丢帧：只数合格边界，不看行数、不看周期，因此不存在
+         * "凑不出480行就永远启动不了"的可能。
+         * 第1个边界只做对齐，之后丢弃3个完整帧，与8月5日PIO里
+         * "1对对齐 wait + set x,2 三次循环"完全等价。
+         */
+        if (cam_skip_boundaries_left > 1u) {
+            cam_skip_boundaries_left--;
+            cam_discarded_frame_count++;
+            return;
+        }
+        cam_skip_boundaries_left = 0u;
+        cam_startup_pending = false;
+
+        /* 消隐期内清掉丢帧期间的PIO/DMA残留，再开启frame 0。 */
+        cam_reset_runtime_capture();
+        cam_pio_rxover_count = 0u;
+        cam_short_line_count = 0u;
+        cam_overrun_count = 0u;
+        cam_descriptor_overrun_count = 0u;
+        cam_skip_done_count++;
+        __dmb();
+        cam_runtime_enabled = true;
+        cam_begin_physical_frame();
+        return;
+    }
+
+    /* 运行期：无条件关旧帧 + 开新帧。DMA/行号/帧号在这里强制刷新。 */
     cam_close_physical_frame();
     cam_begin_physical_frame();
 }

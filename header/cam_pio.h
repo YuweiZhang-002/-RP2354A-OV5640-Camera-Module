@@ -128,18 +128,15 @@ extern volatile uint32_t cam_href_error_count;
 extern volatile uint32_t cam_line_end_count;      /* PIO确认的HREF行总数 */
 extern volatile uint32_t cam_line_publish_count;
 extern volatile uint32_t cam_dataless_row_count;  /* 行号成立但payload缺失 */
-extern volatile uint32_t cam_partial_line_count;  /* VSYNC时DMA不在块边界 */
+extern volatile uint32_t cam_partial_line_count;  /* VSYNC落在一条行中间 */
 extern volatile uint32_t cam_skip_done_count;
 extern volatile uint32_t cam_discarded_frame_count;
-/* VSYNC 边沿判定诊断（现场用它确认耦合是否存在）：
- *   glitch  = 高电平宽度不像真 VSYNC（≈260us）的伪下降沿，通常来自电气耦合
- *   reject  = 通过了宽度判定但落在行活动期或周期过短
- *   period  = 候选边界周期超出 [50,90]ms
- *   row     = 候选周期不是恰好480行，禁止用它关帧 */
+/* 被宽度判定挡掉的VSYNC伪下降沿（10ns级毛刺）。实测上电2个、稳态偶发。 */
 extern volatile uint32_t cam_vsync_glitch_count;
-extern volatile uint32_t cam_vsync_reject_count;
-extern volatile uint32_t cam_vsync_period_error_count;
-extern volatile uint32_t cam_vsync_row_error_count;
+/* PIO对HREF提前结束的行做了补零的次数。实测只在上电805~991ms出现。 */
+extern volatile uint32_t cam_short_line_count;
+/* 活性看门狗触发次数：行号涨到2倍CAPTURE_LINES仍无合格VSYNC。正常应为0。 */
+extern volatile uint32_t cam_frame_rollover_count;
 extern volatile uint32_t cam_startup_error_count;
 extern volatile uint32_t cam_frame_count;
 extern volatile cam_frame_diag_t cam_last_frame_diag;

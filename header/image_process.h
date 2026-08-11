@@ -75,24 +75,17 @@ typedef struct {
 #define IMAGE_JOB_ROW       0u
 #define IMAGE_JOB_FRAME_END 1u
 
+/*
+ * 只保留可验证行节奏的纯计数。原来的 *_last_us / *_max_us 计时埋点
+ * （约20处 time_us_32() 采样）已移除：它们不参与任何判定，
+ * 只是让 Core0/Core1 的热路径变长。
+ */
 typedef struct {
-    volatile uint32_t core0_row_jobs;      /* 应恒等于 core1_packets_sent + 在途 */
+    volatile uint32_t core0_row_jobs;      /* 每帧应为 CAPTURE_LINES */
     volatile uint32_t core0_sobel_rows;    /* 带真实三行窗口的行数 */
     volatile uint32_t core0_repair_rows;   /* INVALID_ROW 占位行数 */
     volatile uint32_t core1_row_jobs;
-    volatile uint32_t core1_packets_sent;
-    volatile uint32_t core0_service_last_us;
-    volatile uint32_t core0_service_max_us;
-    volatile uint32_t core0_push_wait_last_us;
-    volatile uint32_t core0_push_wait_max_us;
-    volatile uint32_t core1_service_last_us;
-    volatile uint32_t core1_service_max_us;
-    volatile uint32_t core1_fpga_busy_wait_last_us;
-    volatile uint32_t core1_fpga_busy_wait_max_us;
-    volatile uint32_t core1_pacing_wait_last_us;
-    volatile uint32_t core1_pacing_wait_max_us;
-    volatile uint32_t core1_tx_wait_last_us;
-    volatile uint32_t core1_tx_wait_max_us;
+    volatile uint32_t core1_packets_sent;  /* 应恒等于 core0_row_jobs */
 } pipeline_timing_stats_t;
 
 /* Wire-format contract: header + payload + trailer must remain 24 + 80 + 24. */

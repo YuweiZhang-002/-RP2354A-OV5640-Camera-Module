@@ -72,20 +72,9 @@ void sys_loop(void)
     }
 }
 
-static inline void update_max(volatile uint32_t *maximum, uint32_t value)
-{
-    if (value > *maximum) {
-        *maximum = value;
-    }
-}
-
 static void core0_push_job(uint32_t job_seq)
 {
-    uint32_t start = time_us_32();
     multicore_fifo_push_blocking(job_seq);
-    uint32_t elapsed = time_us_32() - start;
-    pipeline_timing_stats.core0_push_wait_last_us = elapsed;
-    update_max(&pipeline_timing_stats.core0_push_wait_max_us, elapsed);
 }
 
 static void core0_release_ring(void)
@@ -398,11 +387,7 @@ int main(void)
             continue;
         }
 
-        uint32_t start = time_us_32();
         core0_handle_descriptor(&descriptor);
-        uint32_t elapsed = time_us_32() - start;
-        pipeline_timing_stats.core0_service_last_us = elapsed;
-        update_max(&pipeline_timing_stats.core0_service_max_us, elapsed);
     }
 }
 
@@ -417,29 +402,16 @@ static void core1_send_job(uint32_t job_seq)
         (plt_row_trailer_t *)(packet_buf + sizeof(pkt_row_header_t) +
                               sizeof(pkt_row_payload_t));
 
-    uint32_t wait_start = time_us_32();
     while (fpga_dma_busy()) {
         tight_loop_contents();
     }
-    uint32_t fpga_wait_elapsed = time_us_32() - wait_start;
-    pipeline_timing_stats.core1_fpga_busy_wait_last_us = fpga_wait_elapsed;
-    update_max(&pipeline_timing_stats.core1_fpga_busy_wait_max_us,
-               fpga_wait_elapsed);
 
-    uint32_t pacing_start = time_us_32();
     if (core1_last_tx_start_us != 0u) {
         while ((time_us_32() - core1_last_tx_start_us) <
                FPGA_TX_MIN_START_INTERVAL_US) {
             tight_loop_contents();
         }
     }
-    uint32_t pacing_elapsed = time_us_32() - pacing_start;
-    pipeline_timing_stats.core1_pacing_wait_last_us = pacing_elapsed;
-    update_max(&pipeline_timing_stats.core1_pacing_wait_max_us,
-               pacing_elapsed);
-    uint32_t wait_elapsed = time_us_32() - wait_start;
-    pipeline_timing_stats.core1_tx_wait_last_us = wait_elapsed;
-    update_max(&pipeline_timing_stats.core1_tx_wait_max_us, wait_elapsed);
 
     packet_generator(row_bits, meta, header, payload, trailer);
     core1_last_tx_start_us = time_us_32();
@@ -460,7 +432,6 @@ static void fpga_pio_core1_entry(void)
 
     while (true) {
         uint32_t job_seq = multicore_fifo_pop_blocking();
-        uint32_t start = time_us_32();
         const image_row_job_meta_t *meta = image_get_job_meta(job_seq);
 
         if (meta->job_type == IMAGE_JOB_FRAME_END) {
@@ -483,9 +454,5 @@ static void fpga_pio_core1_entry(void)
             held_job = job_seq;
             held_valid = true;
         }
-
-        uint32_t elapsed = time_us_32() - start;
-        pipeline_timing_stats.core1_service_last_us = elapsed;
-        update_max(&pipeline_timing_stats.core1_service_max_us, elapsed);
     }
 }
