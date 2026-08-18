@@ -1,68 +1,181 @@
-# New Camera Project / 新摄像头项目
+# RP2354A OV5640 Camera Module
 
-This project is a bare-metal Raspberry Pi Pico / RP2350 camera bridge for an OV5640 DVP sensor and an FPGA-side output path.
-这个项目是一个基于 Raspberry Pi Pico / RP2350 的裸机摄像头桥接工程，用于连接 OV5640 DVP 传感器和 FPGA 输出链路。
+English | [Chinese README](README.zh-CN.md)
 
-## Dataflow / 数据流
+This repository contains firmware for an RP2354A-class controller that captures an OV5640 8-bit DVP stream, performs binary Sobel edge processing across both CPU cores, and sends one fixed-size packet per image row to an FPGA through PIO and DMA.
 
-- 中文：OV5640 通过 PIO0 + DMA 完成并行图像采集，图像行先进入三缓冲环，再由主循环交给 PIO1 发送到 FPGA。
-- English: OV5640 data is captured by PIO0 + DMA, stored in a three-buffer line ring, and then handed to PIO1 for output to the FPGA.
+This document describes the source tree at the 2026-08-18 milestone (`8e12162`). The current data path no longer contains the earlier XOR reference-frame or centroid mechanism.
 
-- 中文：当前发送链使用双 DMA / 队列式机制，减少逐行发送时的空档和 stall，保证行间时序更稳定。
-- English: The output path uses a dual-DMA / queue-based mechanism to reduce stalls and line gaps, keeping timing more stable.
+## Current capabilities
 
-## Implementation / 实现机制
+- OV5640 acquisition at 640 x 480, 8-bit grayscale (Y8), approximately 15 fps.
+- PIO-based VSYNC qualification and DVP capture instead of per-pixel CPU interrupts.
+- Four qualified frame boundaries are consumed at startup, so image output begins with the fourth valid frame.
+- Eight-slot raw-line and processed-line rings connect capture, Core 0, and Core 1.
+- Core 0 performs a three-line Sobel operation.
+- Core 1 applies an adaptive threshold, packs 640 binary pixels into 80 bytes, and builds the row packet.
+- PIO and DMA provide an 8-bit FPGA output bus with a 12 MHz byte clock.
+- The wire protocol uses exactly 128 bytes per row and 480 row packets per frame.
 
-- 中文：采集侧由 `cam_pio.c` 负责 GPIO 初始化、PIO 程序加载、DMA 完成中断和行级缓冲管理；发送侧由 `fpga_pio.c` 负责 PIO1、DMA 和数据搬运。
-- English: The capture side is handled by `cam_pio.c` for GPIO setup, PIO loading, DMA completion IRQs, and line-buffer management; the output side is handled by `fpga_pio.c` for PIO1, DMA, and data transfer.
+## Data path
 
-- 中文：OV5640 的初始化和寄存器配置在 `ov5640.c` / `ov5640_set.c` 中完成，`main.c` 只做顶层编排和链路衔接。
-- English: OV5640 initialization and register setup live in `ov5640.c` / `ov5640_set.c`, while `main.c` only orchestrates the top-level flow and connects the chains.
+```text
+OV5640 DVP
+  |  GPIO data / PCLK / HREF / VSYNC
+  v
+PIO0 VSYNC gate ----> qualified startup frame boundaries
+  |
+PIO0 camera capture + DMA
+  |
+8-slot raw-line ring
+  |
+Core 0: 3-line Sobel filter
+  |
+8-slot Sobel result ring + multicore FIFO row notification
+  |
+Core 1: adaptive threshold + 1-bit packing + packet generation
+  |
+PIO1 + DMA: 8-bit data, byte clock, packet HREF
+  v
+FPGA receiver
+```
 
-- 中文：设计参考以 `docs/DESIGN.md` 为准，当前代码优先保证采集、发送和时序控制的可维护性。
-- English: The design reference is `docs/DESIGN.md`, and the current code focuses on maintainable capture, output, and timing control.
+### PIO capture and startup alignment
 
-## Update / 更新
-- (7/11)
-- 中文：今天整理并恢复了当前版本中的引脚与调试残留，FPGA 发送桥路回到 GPIO0-7 数据、GPIO8 时钟；临时调试逻辑已清理，采集停止函数也已补回。
-- English: Today’s cleanup restored the current pin mapping and removed debug leftovers. The FPGA bridge is back to GPIO0-7 for data and GPIO8 for clock; the temporary debug logic was removed, and the capture-stop function was restored.
+`vsync_gate` samples VSYNC at 36 MHz and accepts a candidate only after it remains high for 32 consecutive checks. This is an approximately 58.7 us qualification window and rejects the short startup glitches observed from the sensor.
 
-- 中文：同时保留了当前的双 DMA 发送机制，用来减少行与行之间的随机空档。
-- English: The current dual-DMA output mechanism was kept to reduce random gaps between lines.
+The camera capture state machine then consumes four qualified boundaries: one alignment boundary followed by three complete skipped frames. Continuous HREF/PCLK line capture starts on the fourth valid frame. After the state machine enters its capture loop, HREF and PCLK control line acquisition; it does not use VSYNC to realign each later frame.
 
-- (7/13)
-- 中文：预留给后续三天的修改记录，当前版本先保留这一段作为每天变更的落点。
-- English: Reserved for the next three days of change notes; this section is kept as a daily log anchor for upcoming updates.
+Each 640-byte row is transferred from the PIO RX FIFO into an eight-slot DMA-backed ring. If the ring is full, capture remains non-blocking, increments the overrun counter, and reuses the current slot.
 
-- (7/14)
-- 中文：预留。
-- English: Reserved.
+### Dual-core image processing
 
-- (7/15)
-- 中文：预留。
-- English: Reserved.
+Core 0 acquires a three-row window and generates the Sobel result. Rows 0 and 1 are emitted as zero-filled boundary rows; Sobel output starts at row 2. Core 1 receives row notifications through the multicore FIFO, adjusts the threshold once per frame, converts the result to one bit per pixel, and builds the packet.
 
-- (7/16)
-- 中文：本轮把图像处理链进一步拆分为 Sobel 计算、Threshold 比对/写入和 Filter 打包三段，并把 GPIO9 探针切成独立窗口，方便分别观测各阶段耗时。
-- English: This round further split the image-processing chain into Sobel, Threshold compare/write, and Filter packing stages, and separated the GPIO9 probe windows so each phase can be timed independently.
+The current implementation has no XOR reference-frame comparison, centroid calculation, or motion-vector fields.
 
-- 中文：同时把 Sobel 中间结果与二值化结果分离到不同的行缓冲中，Core 1 侧继续承担 XOR、参考帧更新和 packet 发送，便于后续按预算判断是否将 Threshold 整块迁移到 Core 1。
-- English: Sobel intermediates and binarized rows were also moved into separate line buffers, while Core 1 continues to handle XOR, reference-frame updates, and packet sending, making it easier to decide later whether Threshold should move wholesale to Core 1 based on timing budget.
+### FPGA output
 
-- (7/18)
-- 中文：采集启动改为由 PIO 在入口等待两个完整 VSYNC 周期，严格跳过用于稳定的第一帧，并从第二帧开始进入持续 HREF/PCLK 采样；进入运行循环后 VSYNC 不再控制采集。
-- English: Capture startup now waits through two complete VSYNC boundary pairs in PIO, strictly skipping the first stabilization frame and starting continuous HREF/PCLK sampling from the second frame; VSYNC no longer controls capture after the runtime loop begins.
+PIO1 runs at 48 MHz and uses four state-machine cycles per byte, producing a 12 MHz byte clock. The 8-bit data bus is sent MSB first. GPIO9 is high for the complete 128-byte packet and is lowered only after the PIO reports that the final transmitted byte has left the state machine.
 
-- 中文：行交接统一为 `cam_acquire_line()` / `cam_release_line()` 三行滑动窗口。每帧行 0、1 作为 80-byte `0x00` 白边发送，行 2…479 执行 Sobel、Threshold、XOR 和组包，输出保持完整 480 行。
-- English: Line ownership now uses the `cam_acquire_line()` / `cam_release_line()` three-line sliding window. Rows 0 and 1 are transmitted as 80-byte `0x00` borders, while rows 2 through 479 run Sobel, thresholding, XOR, and packet generation, preserving a complete 480-row output.
+## Hardware configuration
 
-- 中文：行包已固定为 24-byte header + 80-byte payload + 24-byte trailer，共 128 byte，并由静态断言约束布局；当前 CRC 字段固定写入 `0xFFFF`，等待 FPGA 侧计算。当前发送实现经源码确认是单 DMA，并由 `fpga_tx_busy` 串行保护共享 `packet_buf`。
-- English: The row packet is fixed at a 24-byte header, 80-byte payload, and 24-byte trailer (128 bytes total), with static assertions enforcing the layout. The CRC field is currently written as `0xFFFF` for FPGA-side calculation. Source review confirms that the current transmitter uses one DMA channel and serializes access to the shared `packet_buf` with `fpga_tx_busy`.
+| Item | Current setting |
+| --- | --- |
+| Target | RP2350 platform / Pico 2 board definition |
+| System and peripheral clocks | 144 MHz |
+| OV5640 input clock | 24 MHz |
+| Camera mode | 640 x 480 Y8 |
+| DVP pixel clock | Approximately 12 MHz |
+| Sensor timing | HTS 1562, VTS 512, approximately 15.006 fps |
+| FPGA byte clock | 12 MHz |
+| Packet rate | 480 packets per image frame |
 
-- 中文：新增 `docs/img_struct_v6.md`，用 Mermaid 记录当前采集、双核处理、状态量所有权和 FPGA PIO 发送链，并明确列出仍需确认的帧边界、CRC、占位接口和调试配置。
-- English: Added `docs/img_struct_v6.md`, using Mermaid to document the current capture, dual-core processing, state ownership, and FPGA PIO transmit path, together with explicit open questions around frame boundaries, CRC, placeholder interfaces, and debug configuration.
+## Pin assignment
 
-## Build / 编译
+| Function | GPIO |
+| --- | --- |
+| FPGA data D0-D7 | GPIO0-GPIO7 |
+| FPGA byte clock | GPIO8 |
+| FPGA packet HREF/envelope | GPIO9 |
+| OV5640 VSYNC | GPIO10 |
+| OV5640 PCLK | GPIO11 |
+| OV5640 D0-D7 | GPIO12-GPIO19 |
+| OV5640 HREF | GPIO20 |
+| OV5640 XCLK | GPIO21 |
+| OV5640 RESET | GPIO22 |
+| OV5640 SCCB SDA | GPIO26 |
+| OV5640 SCCB SCL | GPIO27 |
+| OV5640 PWDN | GPIO28 |
 
-- 中文：在 VS Code 中可直接运行 `Compile Project` 任务，或使用当前 build 目录继续 Ninja 构建。
-- English: In VS Code, you can run the `Compile Project` task directly, or continue building with Ninja from the existing build directory.
+## 128-byte row packet
+
+All multi-byte numeric fields are transmitted in big-endian byte order.
+
+| Offset | Size | Field | Current value or meaning |
+| ---: | ---: | --- | --- |
+| 0-1 | 2 | Sync word 0 | `A5 A0` |
+| 2-3 | 2 | Sync word 1 | `5A 50` |
+| 4 | 1 | Camera ID | Currently `0` |
+| 5-6 | 2 | Frame ID | Increments per frame |
+| 7-8 | 2 | Row index | `0` to `479` |
+| 9 | 1 | Row flags | Bit 0: overflow; bit 1: final row; bit 2: first processed row (row 2) |
+| 10 | 1 | Payload length | `80` |
+| 11-12 | 2 | Row sequence | Global row-packet sequence counter |
+| 13-23 | 11 | Reserved | Currently zero |
+| 24-103 | 80 | Binary edge payload | 640 pixels, one bit per pixel, MSB first |
+| 104-113 | 10 | Trailer padding | Zero |
+| 114-125 | 12 | Trailer synchronization | `A5 5A` repeated six times |
+| 126-127 | 2 | CRC field | Currently the placeholder `FF FF` |
+
+Bit 2 at offset 9 is not a row-0 or frame-start flag. A receiver must identify the first row from `row_idx == 0`; bit 2 marks row 2, the first row with a complete three-line Sobel window.
+
+The firmware contains a CRC-16/CCITT calculation routine, but packet generation does not currently call it. Until CRC is explicitly enabled, bytes 126-127 remain `0xFFFF` and must be treated as a placeholder rather than a successful CRC result. Offset 13 is also reserved in the RP2354 output and is currently written as zero; any downstream FPGA status-byte replacement must be defined and validated separately.
+
+One frame contains 480 x 128 = 61,440 wire bytes. There is no separate metadata packet in the active data path.
+
+## Build
+
+### Prerequisites
+
+- CMake 3.13 or newer
+- Ninja or another supported CMake generator
+- Arm GNU embedded toolchain
+- Pico SDK 2.2.0-compatible environment
+
+The repository currently expects the Pico SDK in `pico-sdk-master` and imports it through `pico_sdk_import.cmake`.
+
+```powershell
+cmake -S . -B build -G Ninja -DPICO_BOARD=pico2 -DPICO_PLATFORM=rp2350
+cmake --build build --config Release
+```
+
+The flashable image is generated as `build/new_camera_project_app.uf2`. USB standard I/O is enabled; UART standard I/O is disabled.
+
+The project can also be configured and built through the Raspberry Pi Pico extension in Visual Studio Code.
+
+## Source layout
+
+| Path | Purpose |
+| --- | --- |
+| `main.c` | Clock setup, peripheral initialization, multicore pipeline, thresholding, and packet scheduling |
+| `cam_pio.pio` | Qualified VSYNC gate and OV5640 DVP capture state machines |
+| `fpga_pio.pio` | FPGA byte-output state machine |
+| `func/cam_pio.c` | Camera PIO and DMA setup, line-ring ownership, and capture recovery |
+| `func/fpga_pio.c` | FPGA PIO/DMA output and packet-HREF completion handling |
+| `func/image_process.c` | Sobel filtering and current pass-through processing helpers |
+| `func/ov5640.c` | OV5640 initialization and sensor control |
+| `func/ov5640_set.c` | OV5640 register tables and mode settings |
+| `header/` | Shared interfaces and hardware constants |
+| `docs/` | Architecture notes, historical packet documents, and captured traces |
+
+IMU and HSTX-related files remain in the source tree but are not part of the active executable configured by the current `CMakeLists.txt`.
+
+## Development timeline
+
+| Date | Commit | Milestone |
+| --- | --- | --- |
+| 2026-06-22 | `64d476b` | Initial multi-camera repository structure |
+| 2026-07-11 | `0110ddb` | Pin restoration and source cleanup |
+| 2026-07-18 | `9e55e53` | Frame-capture alignment and v6 architecture documentation |
+| 2026-07-28 | `9b75d65` | Bit-order and HREF output corrections |
+| 2026-08-05 | `da9990b` | Startup frame-skip correction |
+| 2026-08-11 | `8233e57` | Boundary experiment retired in preparation for restoration |
+| 2026-08-18 | `8e12162` | PIO alignment update and removal of XOR centroid processing |
+
+## Known limitations and next steps
+
+- Enable CRC-16/CCITT in packet generation and define receiver-side failure signaling after the protocol is frozen.
+- Define whether offset 13 remains reserved or becomes a versioned FPGA diagnostic byte.
+- Add post-startup VSYNC monitoring or controlled realignment if long-running tests show frame-boundary drift.
+- Run long-duration camera-to-FPGA-to-host stress tests and record row jumps, duplicates, overruns, and packet errors.
+- Replace the single shared output packet buffer if processing must overlap more deeply with FPGA transmission.
+- The 4 x 4 buffering scaffold and RLE helper are not active compression features in the present build.
+
+## Reference documents
+
+- [System architecture report](docs/system_architecture_report.md)
+- [Image structure v6](docs/img_struct_v6.md)
+- [Image-processing notes](docs/img_proc_v1.md)
+
+Some files under `docs/` describe earlier protocol revisions. For the active firmware behavior, use the current source and the packet table in this README as the authoritative reference.
