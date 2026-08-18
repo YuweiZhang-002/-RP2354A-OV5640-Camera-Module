@@ -785,14 +785,35 @@ static const sensor_reg_t ov5640_init_common[] = {
     {OV5640_TIMING_VTS_HIGH,    0x02},
     {OV5640_TIMING_VTS_LOW,     0x00},
 
-    /* Keep the AEC frame-length limits equal to VTS so that night-mode
-     * exposure cannot extend the frame period below the requested 15 fps. */
-    {OV5640_AEC_CTRL02, 0x02},
-    {OV5640_AEC_CTRL03, 0x00},
-    {OV5640_AEC_MAX_EXPO_HIGH, 0x02},
-    {OV5640_AEC_MAX_EXPO_LOW, 0x00},
-    {OV5640_AEC_CTRL0D, 0x07}, /* floor((VTS - 4) / 64), 60 Hz bands */
-    {OV5640_AEC_CTRL0E, 0x06}, /* floor((VTS - 4) / 77), 50 Hz bands */
+    /*
+     * ── AEC 曝光上限 ────────────────────────────────────────────────────
+     * 之前这里把上限设成 VTS(512 行 = 66.6 ms)，即"曝光可以占满整帧"。
+     * 暗光下 AEC 会一路顶到上限，快速移动的物体在一次积分内横扫整幅画面
+     * ——这是"动起来撕裂、静止恢复"里运动模糊那一半的直接来源。
+     *
+     * 现在把上限压到**一个防频闪带宽步长**，这是保留防频闪前提下能做到的
+     * 最短曝光（低于一个步长就无法保证市电照明不频闪）：
+     *   60 Hz: B60_STEP = 0x0040 = 64 行 = 64 x 130.167us = 8.33 ms  (= 1/120 s)
+     *   50 Hz: B50_STEP = 0x004D = 77 行 = 77 x 130.167us = 10.02 ms (= 1/100 s)
+     * 相比原来的 66.6 ms，运动模糊行程缩到约 1/8。
+     *
+     * 原来"上限 = VTS"是用来防止夜视模式拉长帧周期的；该保护现在由下面
+     * 显式写入的 AEC_CTRL00 bit2 = 0 直接承担，比靠上限间接约束更可靠。
+     */
+    {OV5640_AEC_CTRL02, 0x00},
+    {OV5640_AEC_CTRL03, 0x40},          /* 60 Hz 曝光上限 = 64 行 = 8.33 ms */
+    {OV5640_AEC_MAX_EXPO_HIGH, 0x00},
+    {OV5640_AEC_MAX_EXPO_LOW, 0x4D},    /* 50 Hz 曝光上限 = 77 行 = 10.02 ms */
+    {OV5640_AEC_CTRL0D, 0x01},          /* 60 Hz 最多 1 个带宽步长 */
+    {OV5640_AEC_CTRL0E, 0x01},          /* 50 Hz 最多 1 个带宽步长 */
+    /*
+     * AEC_CTRL00 原先从未写入，完全依赖上电默认值 0x78。显式写死：
+     *   bit[5] = 1  带宽(防频闪)函数保持使能
+     *   bit[2] = 0  夜视 / 自动降帧率关闭 —— 一旦为 1，传感器会插入 dummy
+     *               行拉长 VTS，帧率掉到 7.5 甚至 3.75 fps
+     * 其余位保持上电默认，不改变现有行为。
+     */
+    {OV5640_AEC_CTRL00, 0x78},
     {0x3618, 0x00},
     {0x3612, 0x29},
     {0x3708, 0x64},

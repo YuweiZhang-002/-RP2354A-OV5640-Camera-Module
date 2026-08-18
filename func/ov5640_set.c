@@ -1,4 +1,5 @@
 /* Includes ------------------------------------------------------------------*/
+#include <stddef.h>        /* NULL */
 #include "ov5640_set.h"
 #include "ov5640.h"        /* ov5640_write_reg() — Pico SCCB writer */
 #include "ov5640_regs.h"   /* sensor_reg_t + register address #defines */
@@ -101,6 +102,7 @@ int32_t OV5640_SetPixelFormat(uint32_t PixelFormat)
 {
   const sensor_reg_t *regs;
   uint32_t count;
+
   switch (PixelFormat)
   {
     case OV5640_RGB565:
@@ -235,4 +237,41 @@ int32_t OV5640_SetActivation(uint32_t Activation)
   }
 
   return ov5640_apply_regs(&ov5640_power_regs[Activation], 1U);
+}
+
+
+/**
+  * @brief  读回 AEC 当前工作点（曝光 / 增益 / HTS / VTS / AEC_CTRL00）。
+  * @note   曝光寄存器 0x3500[3:0]/0x3501/0x3502 是 20-bit、单位 1/16 行。
+  *         行时间 = HTS / PCLK，因此
+  *             exposure_us = exposure_q4 * HTS / (16 * PCLK_MHz)
+  *         校验：上限 64 行时 exposure_q4 = 1024，
+  *               1024 * 1562 / (16*12) = 8331 us = 8.33 ms ✓
+  *         走 SCCB 阻塞读，共 9 次单字节读，不可放在逐行热路径。
+  */
+void OV5640_ReadAecStatus(ov5640_aec_status_t *status)
+{
+  if (status == NULL)
+  {
+    return;
+  }
+
+  uint32_t e_hi  = ov5640_read_reg(OV5640_AEC_PK_EXPOSURE_19_16) & 0x0FU;
+  uint32_t e_mid = ov5640_read_reg(OV5640_AEC_PK_EXPOSURE_HIGH);
+  uint32_t e_lo  = ov5640_read_reg(OV5640_AEC_PK_EXPOSURE_LOW);
+
+  status->exposure_q4 = (e_hi << 16) | (e_mid << 8) | e_lo;
+
+  status->gain_q4 = (uint16_t)(((uint32_t)(ov5640_read_reg(OV5640_AEC_PK_REAL_GAIN_9_8) & 0x03U) << 8) |
+                               ov5640_read_reg(OV5640_AEC_PK_REAL_GAIN_LOW));
+
+  status->hts = (uint16_t)(((uint32_t)ov5640_read_reg(OV5640_TIMING_HTS_HIGH) << 8) |
+                           ov5640_read_reg(OV5640_TIMING_HTS_LOW));
+  status->vts = (uint16_t)(((uint32_t)ov5640_read_reg(OV5640_TIMING_VTS_HIGH) << 8) |
+                           ov5640_read_reg(OV5640_TIMING_VTS_LOW));
+
+  status->aec_ctrl00 = ov5640_read_reg(OV5640_AEC_CTRL00);
+
+  status->exposure_us = (uint32_t)(((uint64_t)status->exposure_q4 * status->hts) /
+                                   (16u * OV5640_PCLK_MHZ));
 }

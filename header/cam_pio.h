@@ -8,24 +8,18 @@
  *   - GPIO 初始化（数据线 + PCLK/HREF/VSYNC）
  *   - PIO 状态机加载与启动
  *   - DMA 通道申请、DREQ 绑定、完成中断里自维持地逐行重装
- *   - 以物理 VSYNC/HREF 为权威生成帧/行身份
- *   - 发布只携带 ownership 的行描述符，不复制 640-byte 图像本体
+ *   - 行级三缓冲环：采集只负责"生产并打标记"，发送侧自行取用
  *
- * 行身份的硬件保证：
- *   cam_capture.pio 在每条 HREF 内精确计数 640 个 PCLK，行首用
- *   wait 0 / wait 1 gpio HREF 重新对齐。因此
- *       一个 HREF  <=>  640 个采样字节  <=>  一次 640-byte DMA 完成
- *   行号由帧内 DMA 块完成次数产生，与 HREF/PCLK 的异步相位无关，
- *   也与 CPU 中断延迟无关（PIO 行尾不再等待 CPU）。
- *
- * 本模块不直接驱动发送链。采集链与处理链通过描述符队列交接：
- *   PIO(640B/行) → DMA完成=行边界 → descriptor queue → Core0 → Core1 → PIO1
+ * 本模块不直接驱动发送链。采集链与发送链通过
+ *   cam_acquire_line() / cam_release_line()
+ * 这一对函数做单点交接，保持单向闭合：
+ *   PIO → DMA → 完成中断(置标记) → 主循环取行 → PIO1
  *
  * 引脚分配（最终版）：
  *   数据总线  GPIO 12-19  (CAM_DATA_PIN_BASE = 12, COUNT = 8)
  *   像素时钟  GPIO 11     (CAM_PCLK_PIN)
- *   场同步    GPIO 10     (CAM_VSYNC_PIN, 启动和运行期物理帧边界)
- *   行有效    GPIO 20     (CAM_HREF_PIN, PIO wait/jmp；CPU不配置GPIO IRQ)
+ *   场同步    GPIO 10     (CAM_VSYNC_PIN, 启动时只用于对齐一次完整帧)
+ *   行有效    GPIO 20     (CAM_HREF_PIN, 运行期兼作jmp pin)
  *   传感器控制 GPIO 22/28 (OV5640_RST_PIN / OV5640_PWDN_PIN)
  */
 
@@ -47,67 +41,18 @@
 #define CAPTURE_BYTES         640u
 #define CAPTURE_LINES         480u
 #define CAPTURE_WORDS       (CAPTURE_BYTES / 4u)
-/* ── 行级缓冲环 ───────────────────────────────────────────────────────────────
+/* ── 行级三缓冲环 ─────────────────────────────────────────────────────────────
  * 采集 DMA 在 N 块行缓冲间循环写入：
  *   - 完成一行 → 该块标记为"就绪"，DMA 立即重装到下一块（中断内，无忙等）
  *   - 主循环取走"就绪"块交给 PIO1 发送，发送完归还，供采集复用
- * 16块给采集/双核处理的瞬时抖动留出余量，发送不会读到正在写的块。
+ * 三块给一行的流水留出余量：采集不必等发送，发送也不会读到正在写的块。
  * 若消费者落后到环满，采集丢弃最新一行并累加 cam_overrun_count（不阻塞采集）。
  * ──────────────────────────────────────────────────────────────────────────*/
-#define CAM_NUM_BUFFERS      16u
-#define CAM_DESC_QUEUE_DEPTH 32u
-#define CAM_INVALID_BUFFER   0xffu
-
-typedef enum {
-    CAM_DESC_LINE = 0u,
-    CAM_DESC_FRAME_END = 1u,
-} cam_descriptor_type_t;
-
-/* 帧失效原因；可组合写入 packet consistency metadata。 */
-#define CAM_FRAME_ERR_DESC_QUEUE_FULL (1u << 0)
-#define CAM_FRAME_ERR_DMA_OVERRUN      (1u << 1)
-#define CAM_FRAME_ERR_PIO_RXOVER       (1u << 2)
-#define CAM_FRAME_ERR_HREF_LENGTH      (1u << 3)
-#define CAM_FRAME_ERR_ROW_JUMP         (1u << 4)
-#define CAM_FRAME_ERR_DUPLICATE_ROW    (1u << 5)
-#define CAM_FRAME_ERR_TOO_MANY_ROWS    (1u << 6)
-#define CAM_FRAME_ERR_TOO_FEW_ROWS     (1u << 7)
-#define CAM_FRAME_ERR_NO_BUFFER        (1u << 8)
-#define CAM_FRAME_ERR_BOUNDARY         (1u << 9)
-
-/*
- * CAM_DESC_LINE 语义：
- *   row_idx / frame_id 永远权威——它们来自 VSYNC 与 PIO 确认的 HREF 行，
- *   与数据是否搬成功无关。
- *   valid == 1 : buffer_idx 指向可用的 640-byte 原始行
- *   valid == 0 : 该物理行确实存在，但 payload 缺失（无空闲 buffer / RXOVER）；
- *                下游必须为它保留行位置，禁止用后一行前移补位。
- */
-typedef struct {
-    uint32_t frame_id;
-    uint32_t descriptor_seq;
-    uint16_t row_idx;
-    uint16_t rows_seen;
-    uint16_t error_flags;
-    uint8_t  buffer_idx;
-    uint8_t  type;
-    uint8_t  valid;
-    uint8_t  reserved;
-} cam_descriptor_t;
-
-/* VSYNC时锁存的上一个物理帧诊断。调试器可直接观察该结构，
- * 无需在实时路径中使用printf。 */
-typedef struct {
-    uint32_t frame_id;
-    uint16_t rows_seen;       /* 本帧PIO确认的HREF行数，正常=CAPTURE_LINES */
-    uint16_t rows_published;  /* 进入描述符队列的行数 */
-    uint16_t error_flags;
-    uint16_t dataless_rows;   /* 行号成立但payload缺失(drop buffer/RXOVER)的行数 */
-} cam_frame_diag_t;
+#define CAM_NUM_BUFFERS      8u
 
 /* ---------------------------------------------------------------------
  * 4x4-buffer (scaffold)
- *  - 预留用于将现有的 line 环（CAM_NUM_BUFFERS）替换为
+ *  - 预留用于将现有的 3-lines 环（CAM_NUM_BUFFERS）替换为
  *    4 个每个包含 4 行的块（总计 16 行的环），以降低中断频率
  *    并为后续压缩算法/批处理提供更大窗口。
  *  - 本头仅提供预置常量与接口声明；实际切换须在 cam_pio.c
@@ -117,29 +62,12 @@ typedef struct {
 #define CAM_4X4_NUM_BUFFERS  4u
 
 
-/* 启用 4x4 scaffold（当前为预留实现，不改变默认line-buffer行为） */
+/* 启用 4x4 scaffold（当前为预留实现，调用不会影响默认 3-buffer 行为） */
 void cam_enable_4x4_scaffold(void);
 
 extern volatile uint8_t  frame_ready;       /* VSYNC 帧边界标记，供 IMU 按帧采样 */
-extern volatile uint32_t cam_overrun_count; /* 缓冲/描述符资源不足累计次数 */
-extern volatile uint32_t cam_descriptor_overrun_count;
-extern volatile uint32_t cam_pio_rxover_count;
-extern volatile uint32_t cam_href_error_count;
-extern volatile uint32_t cam_line_end_count;      /* PIO确认的HREF行总数 */
-extern volatile uint32_t cam_line_publish_count;
-extern volatile uint32_t cam_dataless_row_count;  /* 行号成立但payload缺失 */
-extern volatile uint32_t cam_partial_line_count;  /* VSYNC落在一条行中间 */
-extern volatile uint32_t cam_skip_done_count;
-extern volatile uint32_t cam_discarded_frame_count;
-/* 被宽度判定挡掉的VSYNC伪下降沿（10ns级毛刺）。实测上电2个、稳态偶发。 */
-extern volatile uint32_t cam_vsync_glitch_count;
-/* PIO对HREF提前结束的行做了补零的次数。实测只在上电805~991ms出现。 */
-extern volatile uint32_t cam_short_line_count;
-/* 活性看门狗触发次数：行号涨到2倍CAPTURE_LINES仍无合格VSYNC。正常应为0。 */
-extern volatile uint32_t cam_frame_rollover_count;
-extern volatile uint32_t cam_startup_error_count;
-extern volatile uint32_t cam_frame_count;
-extern volatile cam_frame_diag_t cam_last_frame_diag;
+extern volatile uint32_t cam_overrun_count; /* 环满丢行计数（调试用） */
+extern volatile bool     cam_line_ready;    /* 行就绪标记 */
 
 
 /* ── 函数声明 ─────────────────────────────────────────────────────────────── */
@@ -153,15 +81,22 @@ void cam_pio_init(void);
 /* 申请 DMA 通道、绑定 PIO RX DREQ、注册 DMA 完成中断与 VSYNC 中断（不启动传输） */
 void cam_dma_init(void);
 
-/* 复位采集状态，完成PIO/CPU握手并稳定跳过三个完整物理帧。 */
+/* 复位缓冲环并启动PIO；在PIO入口跳过第一帧，从第二帧开始连续采集 */
 void cam_capture_start(void);
 
 /* 关闭状态机并终止 DMA，清空 FIFO */
 void cam_capture_stop(void);
 
-/* Core0单消费者接口：pop不会释放图像buffer；三行窗口不再需要时显式归还。 */
-bool cam_descriptor_pop(cam_descriptor_t *descriptor);
-const uint8_t *cam_get_buffer(uint8_t buffer_idx);
-void cam_release_buffer(uint8_t buffer_idx);
+/* 访问内部行缓冲，供图像处理层读取已采集的行 */
+const uint8_t *cam_get_buffer(uint32_t index);
+
+/* ── 采集/处理交接（Core 0 主循环调用）────────────────────────────────────────
+ * cam_acquire_line(): 原子认领最新的三行 Sobel 窗口，并通过 p1_abs_row_idx
+ *                     写回窗口末行绝对序号；成功返回 true，否则返回 false。
+ * cam_release_line(): 当前窗口处理完成后归还不再需要的旧行，同时继续保留
+ *                     下一个滑动窗口需要的末两行。
+ * ──────────────────────────────────────────────────────────────────────────*/
+bool cam_acquire_line(uint32_t *p1_abs_row_idx);
+void cam_release_line(void);
 
 #endif /* CAM_PIO_H */

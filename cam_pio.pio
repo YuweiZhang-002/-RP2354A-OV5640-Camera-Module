@@ -1,92 +1,127 @@
+; ──────────────────────────────────────────────────────────────────────────
+; pio0 SM1 — VSYNC 脉宽鉴别器
+;
+; 目的：只有"高电平连续保持超过额定时间"的 VSYNC 脉冲才被认定为真帧边界。
+;
+; 实测依据 (docs/2026-08-11_22-21-22.bin, 100 MSa/s)：
+;   真 VSYNC 高电平 = 260.33 us，周期 66.645 ms，1 秒内恰好 15 个
+;   上电毛刺        = 10 ns  @985.651ms / 986.877ms
+;   稳态毛刺        = 10 ns  @3345.066ms   ← 不只上电阶段会出现
+;   上电超宽脉冲    = 1033.53 us @1002.363ms
+;
+; 为什么必须放在 PIO 里：
+;   SM0 的丢帧序列用 `wait 1 gpio VSYNC` / `wait 0 gpio VSYNC` 数帧，
+;   PIO 以系统时钟采样，10 ns 毛刺足以满足一对 wait ——
+;   于是"丢三帧"可能在几微秒内跑完，采集从帧中间开始。
+;   CPU 侧再怎么判定也管不到 SM0 内部的 wait，所以判定必须在 PIO 内完成。
+;
+; 判定方式：检测到高电平后，连续采样 32x32 次确认它一直是高；
+;   任何一次采样为低就认定是毛刺并重新等待。确认窗口：
+;     外层循环体 = set x(1) + 32 x [jmp pin(1) + jmp x--(1)] + jmp y--(1) = 66 周期
+;     总计 32 x 66 = 2112 个 SM1 周期
+;   SM1 clkdiv = 4 → 36 MHz → 2112 / 36MHz = 58.7 us
+;     对真沿 260.33 us  有 4.4 倍余量
+;     对 10 ns 毛刺     第一次采样就被拒
+;     对 FPGA 包宽 10.67 us（GPIO9 耦合的最坏情况）也被拒
+;   要调整额定值只改 CAM_VSYNC_GATE_CLKDIV。
+;
+; 确认通过后等待下降沿，然后：
+;   irq 4 → 给 SM0 的丢帧序列（wait 1 irq 4 会自动清标志）
+;   irq 0 → 路由到 PIO0_IRQ_0，供 CPU 做帧边界记账（只统计合格的 VSYNC）
+; ──────────────────────────────────────────────────────────────────────────
+
+.program vsync_gate
+
+.define VSYNC 10
+
+vg_wait_high:
+    wait 1 gpio VSYNC           ; 候选上升沿
+    set  y, 31
+vg_outer:
+    set  x, 31
+vg_inner:
+    jmp  pin, vg_still_high      ; jmp_pin = VSYNC
+    jmp  vg_wait_high            ; 中途变低 → 毛刺，重新等
+vg_still_high:
+    jmp  x--, vg_inner
+    jmp  y--, vg_outer
+    ; 到这里已确认 VSYNC 连续高 2112 个 SM1 周期
+    wait 0 gpio VSYNC            ; 真帧边界（下降沿）
+    irq  4                       ; 给 SM0：一个合格帧边界
+    irq  0                       ; 给 CPU：帧边界记账
+    jmp  vg_wait_high
+
+
+; ──────────────────────────────────────────────────────────────────────────
+; pio0 SM0 — 摄像头采集（沿用 8 月 5 日机制）
+;
+;   1. 等 4 个"合格"VSYNC 边界（原来是 4 对 wait 1/wait 0 gpio VSYNC）
+;      —— 唯一的改动就在这里：边界由 SM1 鉴别后经 IRQ4 送达，
+;         10 ns 毛刺再也不可能凑数。
+;   2. 进入 wrap 后不再读取 VSYNC，只由 HREF/PCLK 连续驱动，
+;      行长度由 HREF 电平决定（jmp pin, HREF），与 8 月 5 日完全一致。
+; ──────────────────────────────────────────────────────────────────────────
+
 .program cam_capture
 
 .define PCLK  11
 .define HREF  20
-.define VSYNC 10
 
-; ──────────────────────────────────────────────────────────────────────────
-; 摄像头采集程序 —— 每条 HREF 恒定产出 640 字节，PIO 不触碰 VSYNC
-;
-;   1. irq wait 0  通知CPU：状态机停在确定入口，DMA可以先arm
-;   2. CPU清IRQ0后进入行循环，此后PIO永不等待CPU
-;   3. 每行：wait 0 HREF -> wait 1 HREF -> 输出恰好 640 字节
-;        HREF 仍为高  -> 按 PCLK 采一个真实像素
-;        HREF 已结束  -> 置 IRQ1 并补一个 0 字节
-;
-; 核心不变量（无条件成立，与行长度无关）：
-;     一个 HREF  <=>  恰好 640 个字节  <=>  恰好一次 640-byte DMA 完成
-;
-; 为什么必须补零而不是"HREF高就采"：
-;   实测 docs/2026-08-11_22-21-22.bin，上电 805.4~991.5ms 之间有 176 条
-;   异常行（0 / 11 / 58~92 / 171~178 / 809 / 922 个PCLK），1000ms 之后
-;   23258 条行全部恰好 640 个PCLK。若按 HREF 电平决定行长，
-;   一条短行会让 640-byte DMA 块边界相对 HREF 逐字节永久错位（帧撕裂）；
-;   若按纯计数决定行长，一条短行会让状态机去吃下一行的 PCLK。
-;   PIO 内部补零同时避免这两种失败：块边界永远对齐 HREF，
-;   短行只是自己的尾部变成 0，且补零以约 35ns/字节跑完
-;   （最坏 640 字节 = 22.2us，远小于 76.8us 消隐窗口），绝不会卡死。
-;
-; 为什么 VSYNC 完全不进 PIO：
-;   `wait 1/wait 0 gpio VSYNC` 会被 10ns 毛刺满足。实测 VSYNC 在
-;   985.651ms / 986.877ms / 3345.066ms 出现 3 个 10ns 脉冲，
-;   1002.363ms 出现 1 个 1033.53us 超宽脉冲（真值恒为 260.33us）。
-;   帧边界由 CPU 中断处理，只用"高电平宽度 >= 20us"挡掉 10ns 级毛刺，
-;   见 cam_pio.c 的 cam_gpio_irq_callback()。
-;
-; 行尾不使用 `irq wait`：CPU中断延迟再大也不会让
-; `wait 0 gpio HREF` 吞掉一条已经开始的物理行。
-; ──────────────────────────────────────────────────────────────────────────
+    ; 对齐第一帧起点，但不采集这一帧。
+    wait 1 irq 4
 
-    ; DMA必须先arm。CPU清除IRQ0之前，PIO不会读取任何摄像头电平。
-    irq wait 0
+    ; 等待第一帧结束，在第二帧起点开始连续采集。
+    wait 1 irq 4
+
+    ; 等待第二帧结束，在第三帧起点开始连续采集。
+    wait 1 irq 4
+
+    ; 等待第三帧结束，在第四帧起点开始连续采集。
+    wait 1 irq 4
 
 .wrap_target
 line_loop:
-    ; 每行都从消隐区重新对齐：先确认HREF已结束，再等待新行开始。
-    wait 0 gpio HREF
     wait 1 gpio HREF
 
-    ; 外层20次 x 内层32次 = 640字节，与DVPHO=640严格一致。
-    set y, 19
-outer_loop:
-    set x, 31
 byte_loop:
-    ; jmp_pin = HREF。仍为高 -> 真实像素；已结束 -> 补零。
-    jmp pin, take_byte
-
-    ; 本行发生了补零：置PIO IRQ1（非阻塞），CPU在该行的DMA完成中断里
-    ; 读取并清除，把该行标记为 CAM_FRAME_ERR_HREF_LENGTH。
-    ; 该标志只可能在本块填充期间被置位，因此与行一一对应。
-    irq nowait 1
-    in null, 8              ; 8个0位触发autopush，补一个0字节
-    jmp next_byte
-
-take_byte:
     wait 1 gpio PCLK
     in pins, 8
     wait 0 gpio PCLK
-
-next_byte:
-    jmp x--, byte_loop
-    jmp y--, outer_loop
+    jmp pin, byte_loop
+    jmp line_loop
 .wrap
 
 
 % c-sdk {
 #include "cam_pio.h"
 
+/*
+ * SM1 时钟分频。额定阈值 = 2112 / (clk_sys / CAM_VSYNC_GATE_CLKDIV)
+ *   clk_sys = 144 MHz, clkdiv = 4 → 36 MHz → 58.7 us
+ * 增大该值即提高额定脉宽要求；必须保持远小于真实 VSYNC 高电平宽度
+ * （HTS=1562 时为 260.33 us；HTS=1464 时为 244 us）。
+ */
+#define CAM_VSYNC_GATE_CLKDIV 4.0f
+
 static inline void cam_capture_program_init(PIO pio, uint sm, uint offset)
 {
     pio_sm_config c = cam_capture_program_get_default_config(offset);
 
     sm_config_set_in_pins(&c, CAM_DATA_PIN_BASE);
-    /* jmp pin 用来判断 HREF 是否仍然有效，决定采样还是补零。 */
     sm_config_set_jmp_pin(&c, CAM_HREF_PIN);
     sm_config_set_clkdiv(&c, 1.0f);
     sm_config_set_in_shift(&c, false, true, 8);
-    /* This state machine never transmits.  Joining both FIFO halves gives DMA
-     * eight bytes of RX elasticity instead of four during bus arbitration. */
-    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline void vsync_gate_program_init(PIO pio, uint sm, uint offset)
+{
+    pio_sm_config c = vsync_gate_program_get_default_config(offset);
+
+    /* 该状态机只读 VSYNC，且只通过 jmp pin 读取，不需要 in/out 引脚。 */
+    sm_config_set_jmp_pin(&c, CAM_VSYNC_PIN);
+    sm_config_set_clkdiv(&c, CAM_VSYNC_GATE_CLKDIV);
 
     pio_sm_init(pio, sm, offset, &c);
 }

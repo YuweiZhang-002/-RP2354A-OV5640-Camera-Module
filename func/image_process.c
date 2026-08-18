@@ -4,37 +4,35 @@
 
 #include "pico.h"             /* Pico 统一入口：提供 __not_in_flash_func 与 CMSIS 内建 */
 #include "pico/stdlib.h"      /* Pico 基础类型与 __SMULBB / __SMLABB 等内建支持 */
-#include "hardware/sync.h"    /* __dmb: 跨核job发布/归还内存顺序 */
 #include "cam_pio.h"          /* CAPTURE_BYTES / CAPTURE_LINES / 摄像头行参数 */
 
-/* Core1私有：threshold及完整有效帧的动态阈值状态。 */
+/*
+ * ===================================================================
+ *  全局状态: 按七层数据流模型划分
+ * ===================================================================
+ */
+
+/* 层1 核0私有: Sobel+阈值+动态T状态 */
 static int32_t  T_sq = 14400;              /* 初值=120²,与卷一标定值接轨 */
 static uint32_t frame_edge_count = 0;
 
-/* Core0写/Core1读：Sobel、二值行以及与槽位绑定的packet metadata。 */
+/* 层2 核0写核1读: Sobel 中间结果环（共享 SRAM） */
 static uint32_t sobel_fifo[ROW_FIFO_DEPTH][CAPTURE_BYTES] __attribute__((aligned(4)));
+
+/* 层2 核0写核1读: 行级二值结果环（共享 SRAM） */
 static uint8_t row_fifo[ROW_FIFO_DEPTH][ROW_BYTES];
-static image_row_job_meta_t job_meta_fifo[ROW_FIFO_DEPTH];
 
-/* job序号连续递增，与物理frame/row身份解耦；缺行不会破坏槽位所有权。 */
-static volatile uint32_t image_job_prod_seq = 0u;
-static volatile uint32_t image_job_consumed_seq = 0u;
+/* 层2 跨核同步: Sobel 结果消费计数器，由 core1 在处理后推进 */
+static volatile uint32_t sobel_fifo_consumed_count = 0;
 
-/* Core1私有：线上行包序号。 */
-static uint16_t row_seq = 0u;
-
-pipeline_timing_stats_t pipeline_timing_stats;
+/* 层5 & 6 核1私有: 组包序列与位置状态 */
+static uint16_t frame_id = 0, row_seq = 0;
 
 static void update_threshold(void);
 
 static inline uint16_t wire_u16(uint16_t value)
 {
     return __builtin_bswap16(value);
-}
-
-static inline uint32_t wire_u32(uint32_t value)
-{
-    return __builtin_bswap32(value);
 }
 
 const uint32_t target = (uint32_t)((uint64_t)640 * 480 * 40000u / 1000000u);  /* = 12288 */
@@ -52,20 +50,18 @@ void debug_gpio_init(void)
  */
 void system_init_buffers(void)
 {
+
     memset(sobel_fifo, 0, sizeof(sobel_fifo));
     memset(row_fifo, 0, sizeof(row_fifo));
-    memset(job_meta_fifo, 0, sizeof(job_meta_fifo));
-    memset(&pipeline_timing_stats, 0, sizeof(pipeline_timing_stats));
+    /* 其他状态变量在声明时已初始化为0 */
     frame_edge_count = 0u;
+    frame_id = 0u;
     row_seq = 0u;
-    image_job_prod_seq = 0u;
-    image_job_consumed_seq = 0u;
 }
 
 /**
- * @brief  预留的逐字节 CRC-16-CCITT 扩展入口。
- * @note   当前线上 crc16 仍固定写 0xFFFF，本函数不在实时发送路径中调用。
- *         如后续启用，可按 header/payload/trailer 三段以同一字节顺序计算。
+ * @brief  计算输入数据的 CRC-16-CCITT 校验和 (X.25)。
+ * @note   作用：为数据包生成校验码，确保传输完整性。支持对两块不连续内存进行连续计算。
  */
 uint16_t crc16_ccitt(const void *d1, size_t n1, const void *d2, size_t n2, const void *d3, size_t n3)
 {
@@ -79,9 +75,7 @@ uint16_t crc16_ccitt(const void *d1, size_t n1, const void *d2, size_t n2, const
         for (size_t i = 0; i < lens[part]; i++) {
             crc ^= (uint16_t)p[i] << 8;
             for (int b = 0; b < 8; b++) {
-                crc = (uint16_t)((crc & 0x8000u)
-                    ? (((uint32_t)crc << 1) ^ 0x1021u)
-                    : ((uint32_t)crc << 1));
+                crc = (crc & 0x8000u) ? (crc << 1) ^ 0x1021u : crc << 1;
             }
         }
     }
@@ -237,87 +231,67 @@ size_t rle_encode_row(const uint8_t *bits, uint8_t *out, size_t max_len)
  * @note   作用：构建一个包含同步头、帧/行信息、数据载荷和 CRC 校验的标准化数据包。
  *         位置：在 core1 的发送循环中被调用，为每一行数据生成一个待发送的数据包。
  */
-void packet_generator(const uint8_t *row_bits, const image_row_job_meta_t *meta,
+void packet_generator(const uint8_t *row_bits, uint32_t row_idx, uint32_t frame_id_in, bool overflow,
+                      bool first_line, bool final_line,
                       pkt_row_header_t *header, pkt_row_payload_t *payload, plt_row_trailer_t *trailer)
 {
+    
     header->sync0 = wire_u16(0xA5A0u);
     header->sync1 = wire_u16(0x5A50u);
     header->cam_id = 0u;  /* 摄像头ID，当前版本固定为0 */
-    header->frame_id = wire_u16((uint16_t)meta->frame_id);
-    header->row_idx = wire_u16(meta->row_idx);
-    header->row_flags = meta->row_flags;
+    header->frame_id = wire_u16((uint16_t)frame_id_in);
+    header->row_idx = wire_u16((uint16_t)row_idx);
+    header->row_flags = 0u;
+    if (overflow) {
+        header->row_flags |= PKT_ROW_FLAG_OVERFLOW;  /* 保留行级溢出标志 */
+    }
+    if (final_line) {
+        header->row_flags |= PKT_ROW_FLAG_FINAL_LINE; /* 保留帧尾标志 */
+    } else if (first_line) {
+        header->row_flags |= PKT_ROW_FLAG_FIRST_LINE; /* 保留帧首标志 */
+    }
     header->payload_len = (uint8_t)ROW_BYTES;
     header->row_seq = wire_u16(row_seq++);
     memset(header->reserved, 0, sizeof(header->reserved));
 
     memcpy(payload->payload, row_bits, ROW_BYTES);
+    memset(trailer->pad, 0, sizeof(trailer->pad));
 
-    /* 24-byte trailer保持原偏移/长度，运动矩字段改为一致性metadata。 */
-    trailer->physical_frame_id = wire_u32(meta->frame_id);
-    trailer->physical_rows_seen = wire_u16(meta->physical_rows_seen);
-    trailer->capture_error_flags = wire_u16(meta->capture_error_flags);
-    trailer->descriptor_seq = wire_u32(meta->descriptor_seq);
-    trailer->descriptor_overrun_count = wire_u32(meta->descriptor_overrun_count);
-    trailer->capture_overrun_count = wire_u32(meta->capture_overrun_count);
-    trailer->skip_done_count = wire_u16(meta->skip_done_count);
+    /* XOR/质心已移除：原运动矩字段改为包尾同步图案，供FPGA定位包尾。 */
+    for (uint32_t i = 0u; i < PKT_TRAILER_SYNC_WORDS; ++i) {
+        trailer->sync[i] = wire_u16(PKT_TRAILER_SYNC);
+    }
     trailer->crc16 = wire_u16(0xFFFFu);  /* CRC16 校验码暂时置为65535，FPGA端计算 */
+
+    if (final_line) {
+        update_threshold();
+    }
+    
 }
 
-static uint32_t image_reserve_job(const image_row_job_meta_t *meta)
+/**
+ * @brief  处理一帧中的单行数据，是行级处理流程的入口。
+ * @note   作用：协调调用边缘检测和矩计算，完成对单行数据的核心处理。
+ *         位置：在 main() 主循环中被调用，是 CPU 侧图像处理的起点。
+ *         效果：Sobel 梯度中间结果存入 `sobel_fifo`，供 Core 1 做阈值化与打包。
+ */
+void process_frame_row(const uint8_t *r0, const uint8_t *r1, const uint8_t *r2, uint32_t row_idx)
 {
-    while ((image_job_prod_seq - image_job_consumed_seq) >= ROW_FIFO_DEPTH) {
+
+    /* 增加 sobel_fifo 溢出保护：等待消费者 Core 1 释放空间 */
+    /* (row_idx - sobel_fifo_consumed_count) 是已生产但未消费的行数 */
+    while ((row_idx - sobel_fifo_consumed_count) >= ROW_FIFO_DEPTH) {
+        // FIFO已满，Core0在此等待Core1消费。
+        // tight_loop_contents() 或 sleep_us(1) 可避免总线锁死。
         tight_loop_contents();
     }
+    uint32_t *sobel_pairs = sobel_fifo[row_idx % ROW_FIFO_DEPTH];
 
-    uint32_t job_seq = image_job_prod_seq++;
-    job_meta_fifo[job_seq % ROW_FIFO_DEPTH] = *meta;
-    return job_seq;
-}
+    fused_row_sq(r0, r1, r2, sobel_pairs, 640);
+    /* 内存屏障，确保对 sobel_fifo 的写入在后续跨核通知前完成 */
+    __asm volatile("dmb sy" ::: "memory");
 
-uint32_t image_prepare_sobel_job(const uint8_t *r0, const uint8_t *r1,
-                                 const uint8_t *r2,
-                                 const image_row_job_meta_t *meta)
-{
-    uint32_t job_seq = image_reserve_job(meta);
-    image_row_job_meta_t *stored = &job_meta_fifo[job_seq % ROW_FIFO_DEPTH];
-    stored->has_sobel = 1u;
-    stored->job_type = IMAGE_JOB_ROW;
-    fused_row_sq(r0, r1, r2, sobel_fifo[job_seq % ROW_FIFO_DEPTH], CAPTURE_BYTES);
-    __dmb();
-    return job_seq;
-}
-
-uint32_t image_prepare_zero_job(const image_row_job_meta_t *meta)
-{
-    uint32_t job_seq = image_reserve_job(meta);
-    image_row_job_meta_t *stored = &job_meta_fifo[job_seq % ROW_FIFO_DEPTH];
-    stored->has_sobel = 0u;
-    stored->job_type = IMAGE_JOB_ROW;
-    __dmb();
-    return job_seq;
-}
-
-uint32_t image_prepare_frame_end_job(const image_row_job_meta_t *meta)
-{
-    uint32_t job_seq = image_reserve_job(meta);
-    image_row_job_meta_t *stored = &job_meta_fifo[job_seq % ROW_FIFO_DEPTH];
-    stored->has_sobel = 0u;
-    stored->job_type = IMAGE_JOB_FRAME_END;
-    __dmb();
-    return job_seq;
-}
-
-void image_finalize_job(uint32_t job_seq, uint8_t additional_flags,
-                        uint16_t rows_seen, uint16_t capture_error_flags)
-{
-    image_row_job_meta_t *meta = &job_meta_fifo[job_seq % ROW_FIFO_DEPTH];
-    meta->row_flags |= additional_flags;
-    meta->physical_rows_seen = rows_seen;
-    meta->capture_error_flags |= capture_error_flags;
-    meta->descriptor_overrun_count = cam_descriptor_overrun_count;
-    meta->capture_overrun_count = cam_overrun_count;
-    meta->skip_done_count = (uint16_t)cam_skip_done_count;
-    __dmb();
+    
 }
 
 /**
@@ -340,47 +314,33 @@ static void update_threshold(void)
     frame_edge_count = 0u;
 }
 
-void image_core1_end_frame(bool complete)
+/**
+ * @brief  获取指定行的已处理（二值化）数据。
+ * @note   作用：为发送核心（core1）提供访问已处理行数据的接口。
+ */
+const uint8_t *image_get_row_bits(uint32_t row_idx)
 {
-    if (complete) {
-        update_threshold();
-    } else {
-        /* 不完整帧不参与阈值反馈，也不能把累计量带到下一物理帧。 */
-        frame_edge_count = 0u;
-    }
+    return row_fifo[row_idx % ROW_FIFO_DEPTH];
 }
 
-void image_core1_process_job(uint32_t job_seq)
+/**
+ * @brief  (Core 1) 阈值化 + 位打包，并推进 sobel_fifo 消费计数
+ */
+void image_core1_process_row(uint32_t abs_row_idx, uint32_t frame_row_idx)
 {
-    uint32_t slot = job_seq % ROW_FIFO_DEPTH;
-    uint8_t *bits = row_fifo[slot];
-    const image_row_job_meta_t *meta = &job_meta_fifo[slot];
+    uint8_t *bits = row_fifo[abs_row_idx % ROW_FIFO_DEPTH];
 
-    if (meta->has_sobel == 0u) {
-        /* 8月5日语义中的row0/row1边界行和INVALID_ROW占位行不读取Sobel，
-         * payload固定为80-byte 0。 */
+    if ((frame_row_idx == 0u) || (frame_row_idx ==  1u)) {
+        /* 固定边界行不读取 sobel_fifo；80-byte payload 置 0x00。 */
         memset(bits, 0, ROW_BYTES);
     } else {
+        const uint32_t *sobel_pairs = sobel_fifo[abs_row_idx % ROW_FIFO_DEPTH];
         uint32_t edge_count = 0u;
-        filter_pack_row_bits(sobel_fifo[slot], bits, T_sq,
-                             CAPTURE_BYTES, &edge_count);
+
+        filter_pack_row_bits(sobel_pairs, bits, T_sq, 640, &edge_count);
         frame_edge_count += edge_count;
     }
-    __dmb();
-}
 
-void image_core1_release_job(uint32_t job_seq)
-{
-    __dmb();
-    image_job_consumed_seq = job_seq + 1u;
-}
-
-const uint8_t *image_get_row_bits(uint32_t job_seq)
-{
-    return row_fifo[job_seq % ROW_FIFO_DEPTH];
-}
-
-const image_row_job_meta_t *image_get_job_meta(uint32_t job_seq)
-{
-    return &job_meta_fifo[job_seq % ROW_FIFO_DEPTH];
+    /* 推进消费计数器，通知 Core 0 该行对应的 sobel_fifo 槽位可以被重用 */
+    sobel_fifo_consumed_count = abs_row_idx + 1;
 }
