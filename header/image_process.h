@@ -42,7 +42,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  pad[10];                            /* 104..113 */
     uint16_t sync[PKT_TRAILER_SYNC_WORDS];       /* 114..125，全部 = PKT_TRAILER_SYNC */
-    uint16_t crc16;                              /* 126..127 */
+    uint16_t crc16;                              /* 126..127, CRC-16/CCITT-FALSE over bytes 0..125 */
 } plt_row_trailer_t;
 
 /* Wire-format contract: header + payload + trailer must remain 24 + 80 + 24. */

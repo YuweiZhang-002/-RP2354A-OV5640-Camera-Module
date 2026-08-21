@@ -261,7 +261,15 @@ void packet_generator(const uint8_t *row_bits, uint32_t row_idx, uint32_t frame_
     for (uint32_t i = 0u; i < PKT_TRAILER_SYNC_WORDS; ++i) {
         trailer->sync[i] = wire_u16(PKT_TRAILER_SYNC);
     }
-    trailer->crc16 = wire_u16(0xFFFFu);  /* CRC16 校验码暂时置为65535，FPGA端计算 */
+    /*
+     * CRC-16/CCITT-FALSE covers wire offsets 0..125. The CRC field itself
+     * (offsets 126..127) is excluded, then written in network byte order.
+     */
+    const uint16_t packet_crc = crc16_ccitt(
+        header, sizeof(*header),
+        payload, sizeof(*payload),
+        trailer, offsetof(plt_row_trailer_t, crc16));
+    trailer->crc16 = wire_u16(packet_crc);
 
     if (final_line) {
         update_threshold();

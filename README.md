@@ -106,11 +106,11 @@ All multi-byte numeric fields are transmitted in big-endian byte order.
 | 24-103 | 80 | Binary edge payload | 640 pixels, one bit per pixel, MSB first |
 | 104-113 | 10 | Trailer padding | Zero |
 | 114-125 | 12 | Trailer synchronization | `A5 5A` repeated six times |
-| 126-127 | 2 | CRC field | Currently the placeholder `FF FF` |
+| 126-127 | 2 | CRC field | CRC-16/CCITT-FALSE over offsets 0-125, big-endian |
 
 Bit 2 at offset 9 is not a row-0 or frame-start flag. A receiver must identify the first row from `row_idx == 0`; bit 2 marks row 2, the first row with a complete three-line Sobel window.
 
-The firmware contains a CRC-16/CCITT calculation routine, but packet generation does not currently call it. Until CRC is explicitly enabled, bytes 126-127 remain `0xFFFF` and must be treated as a placeholder rather than a successful CRC result. Offset 13 is also reserved in the RP2354 output and is currently written as zero; any downstream FPGA status-byte replacement must be defined and validated separately.
+Packet generation now calculates CRC-16/CCITT-FALSE with polynomial `0x1021`, initial value `0xFFFF`, no input or output reflection, and final XOR `0x0000`. The calculation covers all packet bytes from offset 0 through offset 125; the result is written to offsets 126-127 in big-endian order. Offset 13 remains reserved in the RP2354 output and is written as zero; any downstream FPGA status-byte replacement must be defined and validated separately. If the FPGA modifies any covered byte, including offset 13, it must recalculate the CRC before forwarding the packet.
 
 One frame contains 480 x 128 = 61,440 wire bytes. There is no separate metadata packet in the active data path.
 
@@ -165,7 +165,7 @@ IMU and HSTX-related files remain in the source tree but are not part of the act
 
 ## Known limitations and next steps
 
-- Enable CRC-16/CCITT in packet generation and define receiver-side failure signaling after the protocol is frozen.
+- Add receiver-side CRC failure reporting and long-duration error-injection tests.
 - Define whether offset 13 remains reserved or becomes a versioned FPGA diagnostic byte.
 - Add post-startup VSYNC monitoring or controlled realignment if long-running tests show frame-boundary drift.
 - Run long-duration camera-to-FPGA-to-host stress tests and record row jumps, duplicates, overruns, and packet errors.
