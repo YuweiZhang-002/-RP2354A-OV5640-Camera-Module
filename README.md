@@ -179,3 +179,9 @@ IMU and HSTX-related files remain in the source tree but are not part of the act
 - [Image-processing notes](docs/img_proc_v1.md)
 
 Some files under `docs/` describe earlier protocol revisions. For the active firmware behavior, use the current source and the packet table in this README as the authoritative reference.
+
+## License
+
+Original project code by Yuwei Zhang is released under the [BSD 3-Clause License](LICENSE).
+
+This repository also contains third-party material. The BSD 3-Clause License does not relicense the `pico-sdk-master/` directory or files carrying upstream notices. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and retain all applicable upstream license files and copyright notices when redistributing the source or firmware.

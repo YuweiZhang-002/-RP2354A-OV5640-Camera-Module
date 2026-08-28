@@ -179,3 +179,9 @@ IMU 和 HSTX 相关文件仍保留在源码树中，但当前 `CMakeLists.txt` �
 - [图像处理说明](docs/img_proc_v1.md)
 
 `docs/` 中的部分文件描述的是旧协议版本。判断当前固件行为时，应以当前源码和本 README 中的 128 字节数据包表格为准。
+
+## 许可证
+
+Yuwei Zhang 编写的本项目原创代码采用 [BSD 3-Clause License](LICENSE) 授权。
+
+本仓库同时包含第三方代码和资料。BSD 3-Clause License 不会重新授权 `pico-sdk-master/` 目录或带有上游版权、许可证声明的文件。重新分发源码或固件时，请阅读 [第三方声明](THIRD_PARTY_NOTICES.md)，并保留所有适用的上游许可证文件和版权声明。
