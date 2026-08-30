@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(cd \"/d/prg/prg_cam/images/new_Temp/attempt16_extrinsics_static\" && head -3 cam1/rows_v2.csv && echo \"...\" && wc -l cam0/rows_v2.csv cam1/rows_v2.csv)",
-      "Read(//d/prg/prg_cam/images/new_Temp/attempt16_extrinsics_static/**)",
-      "Bash(cd \"/d/prg/prg_cam/images/new_Temp/attempt16_extrinsics_static\" *)"
-    ]
-  }
-}
