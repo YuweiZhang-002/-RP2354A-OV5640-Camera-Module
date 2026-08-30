@@ -1,187 +1,140 @@
 # RP2354A OV5640 相机模块
 
-[English README](README.md) | 简体中文
+[English README](README.md) | 中文
 
-本仓库包含面向 RP2354A 系列控制器的相机固件：系统通过 PIO 和 DMA 采集 OV5640 的 8 位 DVP 数据流，在两个 CPU 核心之间完成二值 Sobel 边沿处理，并按图像行向 FPGA 发送固定长度的数据包。
+本仓库包含 RP2354A 级控制器固件：采集 OV5640 8-bit DVP 灰度流，在双核之间完成二值 Sobel 处理，并通过 PIO/DMA 向 FPGA 发送“每图像行一个固定长度包”。本文描述 2026-08-18 里程碑后的有效链路；早期 XOR 参考帧与质心机制不属于当前构建。
 
-本文档对应 2026-08-18 的代码里程碑（`8e12162`）。当前数据通路已经移除早期的 XOR 参考帧、质心和运动量计算机制。
+## 当前能力
 
-## 当前功能
+- OV5640：640×480、Y8，约 15 fps。
+- PIO 对 VSYNC 资格化并完成 DVP 捕获，避免逐像素 CPU 中断。
+- 启动阶段消费四个合格帧边界，从第四个有效帧开始输出。
+- 8-slot 原始行 ring 与 8-slot 处理行 ring 连接 DMA、Core0 和 Core1。
+- Core0 使用三行窗口计算 Sobel；Core1 自适应阈值化并把 640 pixel 打包为 80 byte。
+- PIO1/DMA 提供 8-bit FPGA 数据总线与 12 MHz byte clock。
+- 每行包固定 128 byte，每帧 480 个包。
 
-- 采集 OV5640 的 640 x 480、8 位灰度（Y8）图像，帧率约为 15 fps。
-- 使用 PIO 完成 VSYNC 有效性确认和 DVP 数据采集，不再依赖逐像素 CPU 中断。
-- 启动时消耗四个有效帧边界，从第四个有效帧开始输出图像。
-- 使用八槽原始行环形缓冲区和八槽处理结果环形缓冲区连接采集、Core 0 与 Core 1。
-- Core 0 执行基于三行窗口的 Sobel 运算。
-- Core 1 执行自适应阈值化，将 640 个二值像素压缩为 80 字节，并生成行数据包。
-- 通过 PIO 和 DMA 向 FPGA 提供 8 位数据总线与 12 MHz 字节时钟。
-- 线协议固定为每行 128 字节，每帧发送 480 个行包。
-
-## 数据流架构
+## 有效数据通路
 
 ```text
-OV5640 DVP
-  |  GPIO 数据 / PCLK / HREF / VSYNC
-  v
-PIO0 VSYNC 门控 ----> 启动阶段的有效帧边界
-  |
-PIO0 相机采集 + DMA
-  |
-八槽原始行环形缓冲区
-  |
-Core 0：三行 Sobel 滤波
-  |
-八槽 Sobel 结果缓冲区 + 多核 FIFO 行通知
-  |
-Core 1：自适应阈值 + 1 bit 打包 + 数据包生成
-  |
-PIO1 + DMA：8 位数据、字节时钟、数据包 HREF
-  v
-FPGA 接收机
+OV5640 DVP (D/PCLK/HREF/VSYNC)
+  -> PIO0 VSYNC qualification
+  -> PIO0 capture + DMA
+  -> 8-slot raw-line ring
+  -> Core0: three-line Sobel
+  -> 8-slot Sobel ring + multicore FIFO notification
+  -> Core1: threshold + 1-bit packing + row packet
+  -> PIO1 + DMA: 8-bit data / byte clock / packet HREF
+  -> FPGA receiver
 ```
 
-### PIO 采集与启动对齐
+`vsync_gate` 以 36 MHz 采样 VSYNC，只有连续 32 次为高才接受候选边界，对应约 58.7 µs 的资格窗口。相机 capture 状态机随后消费一个对齐边界和三个完整跳过帧；进入持续捕获后以 HREF/PCLK 处理行，不在每帧用 VSYNC 重新对齐。
 
-`vsync_gate` 以 36 MHz 采样 VSYNC。只有候选脉冲连续保持高电平并通过 32 次检查后，才会被认定为有效 VSYNC。该确认窗口约为 58.7 us，可过滤相机上电阶段观察到的短毛刺。
+每行 640 byte 经 DMA 写入八槽 ring。ring 满时捕获保持非阻塞，overrun counter 增加并复用当前槽。Core0 对三行窗口做 Sobel；row0/row1 输出零边界，真正 Sobel output 从 row2 开始。Core1 经 multicore FIFO 收到行通知，每帧调整阈值，把结果压成 1 bit/pixel 并组包。
 
-随后，相机采集状态机会消耗四个有效边界：第一个边界用于对齐，之后跳过三个完整帧，并从第四个有效帧开始连续采集。状态机进入采集循环后，行采集由 HREF 和 PCLK 驱动，不会在后续每一帧使用 VSYNC 重新对齐。
-
-每行 640 字节由 DMA 从 PIO RX FIFO 搬运到八槽环形缓冲区。缓冲区满时，采集路径不会阻塞；系统会增加 overrun 计数并复用当前槽位。
-
-### 双核图像处理
-
-Core 0 获取三行窗口并生成 Sobel 结果。由于图像上边界缺少完整窗口，第 0、1 行发送全零数据，从第 2 行开始发送 Sobel 结果。Core 1 通过多核 FIFO 接收行通知，每帧调整一次阈值，将结果转为每像素 1 bit，并生成数据包。
-
-当前实现不再包含 XOR 参考帧对比、质心计算或运动向量字段。
-
-### FPGA 输出
-
-PIO1 运行于 48 MHz，每个字节使用四个状态机周期，因此生成 12 MHz 字节时钟。8 位数据按 MSB 优先顺序发送。GPIO9 在整个 128 字节数据包期间保持高电平；只有在 PIO 确认最后一个字节已经离开状态机后，GPIO9 才会拉低。
+PIO1 运行在 48 MHz，每 byte 使用四个 state-machine cycle，因此 byte clock 为 12 MHz。8-bit data 按 MSB first 输出。GPIO9 在完整 128-byte packet 期间保持高，并在最后一个 byte 真正离开 PIO 后降低。
 
 ## 硬件配置
 
-| 项目 | 当前设置 |
-| --- | --- |
-| 目标平台 | RP2350 平台 / Pico 2 开发板定义 |
-| 系统与外设时钟 | 144 MHz |
-| OV5640 输入时钟 | 24 MHz |
-| 相机模式 | 640 x 480 Y8 |
-| DVP 像素时钟 | 约 12 MHz |
-| 传感器时序 | HTS 1562、VTS 512，约 15.006 fps |
-| FPGA 字节时钟 | 12 MHz |
-| 数据包数量 | 每帧 480 包 |
+| 项目 | 当前值 |
+|---|---|
+| Target | RP2350 platform / Pico 2 board |
+| 系统与 peripheral clock | 144 MHz |
+| OV5640 XCLK | 24 MHz |
+| Camera mode | 640×480 Y8 |
+| DVP PCLK | 约 12 MHz |
+| Sensor timing | HTS 1562、VTS 512、约 15.006 fps |
+| FPGA byte clock | 12 MHz |
+| Packet rate | 每帧 480 包 |
 
-## 引脚分配
+## 引脚
 
 | 功能 | GPIO |
-| --- | --- |
-| FPGA 数据 D0-D7 | GPIO0-GPIO7 |
-| FPGA 字节时钟 | GPIO8 |
-| FPGA 数据包 HREF/包络 | GPIO9 |
+|---|---|
+| FPGA D0-D7 | GPIO0-GPIO7 |
+| FPGA byte clock | GPIO8 |
+| FPGA packet HREF/envelope | GPIO9 |
 | OV5640 VSYNC | GPIO10 |
 | OV5640 PCLK | GPIO11 |
 | OV5640 D0-D7 | GPIO12-GPIO19 |
 | OV5640 HREF | GPIO20 |
 | OV5640 XCLK | GPIO21 |
 | OV5640 RESET | GPIO22 |
-| OV5640 SCCB SDA | GPIO26 |
-| OV5640 SCCB SCL | GPIO27 |
+| SCCB SDA/SCL | GPIO26/GPIO27 |
 | OV5640 PWDN | GPIO28 |
 
-## 128 字节行数据包
+## 128-byte 行包协议
 
-所有多字节数值字段均按大端字节序发送。
+所有多字节数值均为大端。
 
-| 偏移 | 长度 | 字段 | 当前值或含义 |
-| ---: | ---: | --- | --- |
-| 0-1 | 2 | 同步字 0 | `A5 A0` |
-| 2-3 | 2 | 同步字 1 | `5A 50` |
-| 4 | 1 | 相机 ID | 当前为 `0` |
-| 5-6 | 2 | 帧 ID | 每帧递增 |
-| 7-8 | 2 | 行索引 | `0` 至 `479` |
-| 9 | 1 | 行标志 | bit 0：溢出；bit 1：最后一行；bit 2：首个有效处理行（第 2 行） |
-| 10 | 1 | Payload 长度 | `80` |
-| 11-12 | 2 | 行序列号 | 全局行包序列计数器 |
-| 13-23 | 11 | 保留区 | 当前填零 |
-| 24-103 | 80 | 二值边沿 Payload | 640 像素，每像素 1 bit，MSB 优先 |
-| 104-113 | 10 | 尾部填充 | 填零 |
-| 114-125 | 12 | 尾部同步区 | `A5 5A` 重复六次 |
-| 126-127 | 2 | CRC 字段 | offset 0-125 的 CRC-16/CCITT-FALSE，大端字节序 |
+| Offset | Size | 字段 | 当前语义 |
+|---:|---:|---|---|
+| 0-1 | 2 | Sync0 | `A5 A0` |
+| 2-3 | 2 | Sync1 | `5A 50` |
+| 4 | 1 | Camera ID | MCU 当前写 0；FPGA 可按物理入口覆盖 |
+| 5-6 | 2 | Frame ID | 每帧递增 |
+| 7-8 | 2 | Row index | 0..479 |
+| 9 | 1 | Row flags | bit0 overflow；bit1 final row；bit2 first processed row |
+| 10 | 1 | Payload length | 80 |
+| 11-12 | 2 | Row sequence | 全局行包序列 |
+| 13-23 | 11 | Reserved | MCU 写 0；FPGA 可独立写 status |
+| 24-103 | 80 | Binary payload | 640 pixel，1 bit/pixel，MSB first |
+| 104-113 | 10 | Padding | 0 |
+| 114-125 | 12 | Trailer sync | `A5 5A` 重复六次 |
+| 126-127 | 2 | CRC | CCITT-FALSE over 0..125，大端 |
 
-offset 9 的 bit 2 不是第 0 行或帧起点标志。接收端应通过 `row_idx == 0` 判断首行；bit 2 标记第 2 行，即第一个具备完整三行 Sobel 窗口的处理行。
+offset9 bit2 不是 frame-start；它标记 row2，即第一个拥有完整三行 Sobel window 的处理行。接收端必须用 `row_idx==0` 判断真正帧首行。
 
-数据包生成端现已启用 CRC-16/CCITT-FALSE：多项式为 `0x1021`，初始值为 `0xFFFF`，输入和输出均不反射，最终异或值为 `0x0000`。CRC 覆盖 offset 0 至 offset 125，并以大端字节序写入 offset 126-127。RP2354 仍会把 offset 13 写为零；如果 FPGA 后续替换包括 offset 13 在内的任何 CRC 覆盖字节，则必须在转发数据包前重新计算 CRC。
+CRC-16/CCITT-FALSE 参数为 polynomial `0x1021`、initial `0xFFFF`、不反射、final XOR `0x0000`。MCU 对 offset0..125 计算并以大端写 126/127。若 FPGA 改写 offset4、13 或其他 CRC 覆盖字节，就必须在转发前重新计算出站 CRC。一帧在线路上包含 `480×128=61,440` byte，没有独立 metadata packet。
 
-每帧在线路上发送 480 x 128 = 61,440 字节。当前活动数据通路没有独立的元数据包。
+## 构建
 
-## 构建方法
+前置条件：CMake 3.13+、Ninja（或其他 CMake generator）、Arm GNU embedded toolchain、兼容 Pico SDK 2.2.0 的环境。
 
-### 前置条件
-
-- CMake 3.13 或更高版本
-- Ninja 或其他受 CMake 支持的生成器
-- Arm GNU 嵌入式工具链
-- 与 Pico SDK 2.2.0 兼容的环境
-
-当前仓库默认从 `pico-sdk-master` 导入 Pico SDK，并使用 `pico_sdk_import.cmake` 完成配置。
+tracked `pico_sdk_import.cmake` 通过 `PICO_SDK_PATH` 导入外部 SDK；不要把 SDK 复制进本仓库。
 
 ```powershell
+$repo = 'D:\prg\blank_project\MCU_Camera_Module'
+$env:PICO_SDK_PATH = 'C:\Users\<USER>\.pico-sdk\sdk\2.2.0' # <- 本机 SDK
+Set-Location $repo
 cmake -S . -B build -G Ninja -DPICO_BOARD=pico2 -DPICO_PLATFORM=rp2350
+if ($LASTEXITCODE -ne 0) { throw 'MCU configure 失败' }
 cmake --build build --config Release
+if ($LASTEXITCODE -ne 0) { throw 'MCU build 失败' }
 ```
 
-可烧录文件生成于 `build/new_camera_project_app.uf2`。当前启用 USB 标准输入输出，并关闭 UART 标准输入输出。
+可烧写文件为 `build/new_camera_project_app.uf2`。USB stdio 打开，UART stdio 关闭。
 
-也可以使用 Visual Studio Code 的 Raspberry Pi Pico 扩展配置和编译项目。
+## 源码布局
 
-## 源码结构
+| 路径 | 职责 |
+|---|---|
+| `main.c` | clock/init、双核 pipeline、threshold 与 packet scheduling |
+| `cam_pio.pio` | VSYNC gate 与 OV5640 DVP capture SM |
+| `fpga_pio.pio` | FPGA byte-output SM |
+| `func/cam_pio.c` | PIO/DMA、ring ownership、capture recovery |
+| `func/fpga_pio.c` | FPGA PIO/DMA 与 packet HREF completion |
+| `func/image_process.c` | Sobel、threshold、packing、packet generation |
+| `func/ov5640*.c` | sensor 初始化、控制和寄存器表 |
+| `header/` | 接口和硬件常量 |
 
-| 路径 | 用途 |
-| --- | --- |
-| `main.c` | 时钟、外设初始化、双核流水线、阈值化与数据包调度 |
-| `cam_pio.pio` | VSYNC 有效性门控与 OV5640 DVP 采集状态机 |
-| `fpga_pio.pio` | FPGA 字节输出状态机 |
-| `func/cam_pio.c` | 相机 PIO/DMA 配置、行缓冲区所有权与采集恢复 |
-| `func/fpga_pio.c` | FPGA PIO/DMA 输出和数据包 HREF 完成处理 |
-| `func/image_process.c` | Sobel 滤波与当前透传型处理辅助函数 |
-| `func/ov5640.c` | OV5640 初始化和传感器控制 |
-| `func/ov5640_set.c` | OV5640 寄存器表与模式设置 |
-| `header/` | 公共接口与硬件常量 |
-| `docs/` | 架构记录、历史数据包文档和采集波形 |
+IMU/HSTX 文件仍在源码树，但当前 `CMakeLists.txt` 没有把它们链接进活动 executable。
 
-IMU 和 HSTX 相关文件仍保留在源码树中，但当前 `CMakeLists.txt` 配置的活动可执行文件不会编译或调用它们。
+## 已知限制
 
-## Git 开发时间线
+- 长时间相机→FPGA→Host 压测仍需绑定统一 run manifest。
+- offset13 的 FPGA diagnostic 所有权必须与 MCU reserved 语义保持分离。
+- 若长期运行发现帧边界漂移，需要受控 VSYNC realignment 设计与验证。
+- 当前单一共享输出 packet buffer 限制更深的处理/发送重叠。
+- 4×4 scaffold 与 RLE helper 不是当前 active compression feature。
 
-| 日期 | 提交 | 里程碑 |
-| --- | --- | --- |
-| 2026-06-22 | `64d476b` | 建立多相机项目仓库结构 |
-| 2026-07-11 | `0110ddb` | 恢复引脚定义并清理源码 |
-| 2026-07-18 | `9e55e53` | 完成帧采集对齐并补充 v6 架构文档 |
-| 2026-07-28 | `9b75d65` | 修正位顺序和 HREF 输出 |
-| 2026-08-05 | `da9990b` | 修正启动阶段跳帧机制 |
-| 2026-08-11 | `8233e57` | 停用失败的边界实验并准备恢复架构 |
-| 2026-08-18 | `8e12162` | 更新 PIO 对齐机制并移除 XOR 质心处理 |
+## 跨仓库指南
 
-## 已知限制与后续工作
+- [MCU 架构与代码](https://github.com/YuweiZhang-002/FPGA-Based-Camera-Buffer/blob/main/docs/ZH/01_mcu_architecture_and_code_guide.zh-CN.md)
+- [MCU 构建、运行与调试](https://github.com/YuweiZhang-002/FPGA-Based-Camera-Buffer/blob/main/docs/ZH/02_mcu_build_run_and_debug_guide.zh-CN.md)
 
-- 增加接收端 CRC 失败指示，并执行长时间错误注入测试。
-- 明确 offset 13 是继续保留，还是作为带协议版本的 FPGA 诊断状态字节。
-- 如果长时间测试发现帧边界漂移，应增加启动后的 VSYNC 监控或受控重新对齐机制。
-- 执行相机到 FPGA 再到主机的长时间压力测试，记录跳行、重复行、缓冲溢出和数据包错误。
-- 如果需要让处理和 FPGA 发送进一步重叠，应替换当前单一共享输出包缓冲区。
-- 当前 4 x 4 缓冲框架和 RLE 辅助函数尚未形成活动的压缩功能。
-
-## 参考文档
-
-- [系统架构报告](docs/system_architecture_report.md)
-- [图像结构 v6](docs/img_struct_v6.md)
-- [图像处理说明](docs/img_proc_v1.md)
-
-`docs/` 中的部分文件描述的是旧协议版本。判断当前固件行为时，应以当前源码和本 README 中的 128 字节数据包表格为准。
+协议判定仍以当前 `packet_generator()` 和本 README 的 packet table 为准；跨仓库教程不能覆盖实际发出的 byte。
 
 ## 许可证
 
-Yuwei Zhang 编写的本项目原创代码采用 [BSD 3-Clause License](LICENSE) 授权。
-
-本仓库同时包含第三方代码和资料。BSD 3-Clause License 不会重新授权 `pico-sdk-master/` 目录或带有上游版权、许可证声明的文件。重新分发源码或固件时，请阅读 [第三方声明](THIRD_PARTY_NOTICES.md)，并保留所有适用的上游许可证文件和版权声明。
+Yuwei Zhang 的原创代码采用 [BSD 3-Clause License](LICENSE)。带上游声明的文件仍服从相应上游条款；发布前阅读 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 并保留所需声明。
