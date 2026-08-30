@@ -1,4 +1,5 @@
 build
+build*/
 !.vscode/*
 !.docs/*
 !.pico_sdk_master/*

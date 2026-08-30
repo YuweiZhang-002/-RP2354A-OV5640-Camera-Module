@@ -123,7 +123,9 @@ One frame contains 480 x 128 = 61,440 wire bytes. There is no separate metadata 
 - Arm GNU embedded toolchain
 - Pico SDK 2.2.0-compatible environment
 
-The repository currently expects the Pico SDK in `pico-sdk-master` and imports it through `pico_sdk_import.cmake`.
+The tracked `pico_sdk_import.cmake` shim imports the SDK selected by
+`PICO_SDK_PATH`.  The SDK is an external toolchain dependency and is not
+expected to be copied into this repository.
 
 ```powershell
 cmake -S . -B build -G Ninja -DPICO_BOARD=pico2 -DPICO_PLATFORM=rp2350
@@ -147,7 +149,7 @@ The project can also be configured and built through the Raspberry Pi Pico exten
 | `func/ov5640.c` | OV5640 initialization and sensor control |
 | `func/ov5640_set.c` | OV5640 register tables and mode settings |
 | `header/` | Shared interfaces and hardware constants |
-| `docs/` | Architecture notes, historical packet documents, and captured traces |
+| `README.md` / `README.zh-CN.md` | Active packet contract and firmware quick start |
 
 IMU and HSTX-related files remain in the source tree but are not part of the active executable configured by the current `CMakeLists.txt`.
 
@@ -174,14 +176,20 @@ IMU and HSTX-related files remain in the source tree but are not part of the act
 
 ## Reference documents
 
-- [System architecture report](docs/system_architecture_report.md)
-- [Image structure v6](docs/img_struct_v6.md)
-- [Image-processing notes](docs/img_proc_v1.md)
+The cross-repository cold-start architecture and laboratory procedures are
+owned by the FPGA integration repository:
 
-Some files under `docs/` describe earlier protocol revisions. For the active firmware behavior, use the current source and the packet table in this README as the authoritative reference.
+- [MCU architecture and code guide](https://github.com/YuweiZhang-002/FPGA-Based-Camera-Buffer/blob/main/docs/01_mcu_architecture_and_code_guide.md)
+- [MCU build, run and debug guide](https://github.com/YuweiZhang-002/FPGA-Based-Camera-Buffer/blob/main/docs/02_mcu_build_run_and_debug_guide.md)
+
+For active firmware behavior, this README's packet table and the current
+source remain authoritative.  The linked integration guides must not override
+the bytes emitted by `packet_generator()`.
 
 ## License
 
 Original project code by Yuwei Zhang is released under the [BSD 3-Clause License](LICENSE).
 
-This repository also contains third-party material. The BSD 3-Clause License does not relicense the `pico-sdk-master/` directory or files carrying upstream notices. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and retain all applicable upstream license files and copyright notices when redistributing the source or firmware.
+Files carrying upstream notices retain their upstream terms. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and retain all applicable
+license files and copyright notices when redistributing source or firmware.

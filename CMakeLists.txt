@@ -36,7 +36,9 @@ if(NOT DEFINED PICO_BOARD)
     set(PICO_BOARD pico2)
 endif()
 
-include(${CMAKE_CURRENT_LIST_DIR}/pico-sdk-master/pico_sdk_import.cmake)
+# The SDK is an external build dependency.  The standard import helper resolves
+# PICO_SDK_PATH or a sibling SDK checkout; the repository does not vendor it.
+include(${CMAKE_CURRENT_LIST_DIR}/pico_sdk_import.cmake)
 
 project(new_camera_project C CXX ASM)
 
