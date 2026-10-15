@@ -4,8 +4,8 @@ English | [Chinese README](README.zh-CN.md)
 
 > ## ⚠️ Timing erratum: the 73 µs per-row figure predates the CRC calculation
 >
-> A per-row (Core 0) execution time of **73 µs** was measured against waveform data
-> captured on **2026-08-18** (commit `8e12162`), which is **before** commit
+> A per-row (Core 1) execution time of **73 µs** was 
+> **captured** on **2026-08-18** (commit `8e12162`), which is **before** commit
 > `1c0db34` on **2026-08-21** ("introduced CRC calculation") and before the
 > **2026-08-22** build that produced `build/new_camera_project_app.elf`.
 >
@@ -15,7 +15,7 @@ English | [Chinese README](README.zh-CN.md)
 >
 > What this means:
 >
-> - **The Core 0 figure (73 µs) is still valid.** No code on the Core 0 path was
+> - **The Core 0 figure (79 µs) is still valid.** No code on the Core 0 path was
 >   changed by that commit.
 > - **Every Core 1 per-row figure, and every system-level headroom, utilization or
 >   throughput conclusion derived from it, is superseded** and must be re-measured
@@ -28,9 +28,7 @@ English | [Chinese README](README.zh-CN.md)
 >   table-driven implementation. **Re-measure Core 1 before quoting any system
 >   headroom figure.**
 >
-> The per-row hard deadline is **130.167 µs** (HTS 1562 at a 12 MHz PCLK). If the
-> re-measured Core 1 per-row time approaches that value, the capture ring can
-> overrun. See [Known limitations and next steps](#known-limitations-and-next-steps).
+> The per-row hard deadline is **130.167 µs** (HTS 1562 at a 12 MHz PCLK).
 
 This repository contains firmware for an RP2354A-class controller that captures an OV5640 8-bit DVP stream, performs binary Sobel edge processing across both CPU cores, and sends one fixed-size packet per image row to an FPGA through PIO and DMA.
 
