@@ -264,6 +264,29 @@ void packet_generator(const uint8_t *row_bits, uint32_t row_idx, uint32_t frame_
     /*
      * CRC-16/CCITT-FALSE covers wire offsets 0..125. The CRC field itself
      * (offsets 126..127) is excluded, then written in network byte order.
+     *
+     * ------------------------------------------------------------------
+     * TIMING ERRATUM (do not delete without replacing it with a measurement)
+     *
+     * This call was introduced by commit 1c0db34 (2026-08-21). Before that
+     * commit the trailer field was the placeholder 0xFFFF and the FPGA
+     * computed the CRC itself. packet_generator() runs on Core 1 only, so:
+     *
+     *   - Core 0 timing figures measured before the 2026-08-22 build stay
+     *     valid, because no Core 0 code changed;
+     *   - any Core 1 or system-headroom figure published before that build
+     *     is PRE-CRC and must not be quoted.
+     *
+     * Cost of this call as implemented (crc16_ccitt() below is a per-bit
+     * loop, not a table): roughly 44 instructions per byte over 126 bytes,
+     * i.e. about 6.7 k instructions added to Core 1 per row. The per-row
+     * hard deadline is 130.167 us (HTS 1562 at 12 MHz PCLK). If a
+     * re-measured Core 1 per-row time approaches that deadline, replace
+     * the bit loop with a 256-entry table. Protocol parameters must not
+     * change: poly 0x1021, init 0xFFFF, no reflection, xorout 0x0000,
+     * coverage 0..125, big-endian at 126..127. Self-test:
+     * crc16_ccitt("123456789") must return 0x29B1.
+     * ------------------------------------------------------------------
      */
     const uint16_t packet_crc = crc16_ccitt(
         header, sizeof(*header),

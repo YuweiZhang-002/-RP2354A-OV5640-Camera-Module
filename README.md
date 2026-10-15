@@ -2,9 +2,39 @@
 
 English | [Chinese README](README.zh-CN.md)
 
+> ## ⚠️ Timing erratum: the 73 µs per-row figure predates the CRC calculation
+>
+> A per-row (Core 0) execution time of **73 µs** was measured against waveform data
+> captured on **2026-08-18** (commit `8e12162`), which is **before** commit
+> `1c0db34` on **2026-08-21** ("introduced CRC calculation") and before the
+> **2026-08-22** build that produced `build/new_camera_project_app.elf`.
+>
+> Commit `1c0db34` changed exactly one function body: `packet_generator()` in
+> `func/image_process.c`, replacing `trailer->crc16 = 0xFFFF` (a placeholder) with a
+> real `crc16_ccitt()` call. **`packet_generator()` executes on Core 1 only.**
+>
+> What this means:
+>
+> - **The Core 0 figure (73 µs) is still valid.** No code on the Core 0 path was
+>   changed by that commit.
+> - **Every Core 1 per-row figure, and every system-level headroom, utilization or
+>   throughput conclusion derived from it, is superseded** and must be re-measured
+>   on a build dated 2026-08-22 or later.
+> - **Waveform captures dated 2026-08-18 or earlier cannot be used to validate CRC
+>   behaviour.** In those traces the trailer CRC field is the placeholder `FFFF`,
+>   not a computed CRC-16/CCITT-FALSE value.
+> - The CRC is a per-bit loop (approximately 44 instructions per byte over 126
+>   bytes, i.e. roughly 6.7 k instructions added per row on Core 1), not a
+>   table-driven implementation. **Re-measure Core 1 before quoting any system
+>   headroom figure.**
+>
+> The per-row hard deadline is **130.167 µs** (HTS 1562 at a 12 MHz PCLK). If the
+> re-measured Core 1 per-row time approaches that value, the capture ring can
+> overrun. See [Known limitations and next steps](#known-limitations-and-next-steps).
+
 This repository contains firmware for an RP2354A-class controller that captures an OV5640 8-bit DVP stream, performs binary Sobel edge processing across both CPU cores, and sends one fixed-size packet per image row to an FPGA through PIO and DMA.
 
-This document describes the source tree at the 2026-08-18 milestone (`8e12162`). The current data path no longer contains the earlier XOR reference-frame or centroid mechanism.
+This document describes the current source tree, which includes the CRC calculation introduced on 2026-08-21 (`1c0db34`). The current data path no longer contains the earlier XOR reference-frame or centroid mechanism.
 
 ## Current capabilities
 
@@ -163,10 +193,15 @@ IMU and HSTX-related files remain in the source tree but are not part of the act
 | 2026-07-28 | `9b75d65` | Bit-order and HREF output corrections |
 | 2026-08-05 | `da9990b` | Startup frame-skip correction |
 | 2026-08-11 | `8233e57` | Boundary experiment retired in preparation for restoration |
-| 2026-08-18 | `8e12162` | PIO alignment update and removal of XOR centroid processing |
+| 2026-08-18 | `8e12162` | PIO alignment update and removal of XOR centroid processing. **Timing measurements quoted in the thesis were taken against waveforms captured at this commit, i.e. before the CRC calculation existed.** |
+| 2026-08-21 | `1c0db34` | CRC-16/CCITT-FALSE is now computed on the MCU inside `packet_generator()` (Core 1), instead of leaving the trailer field as `FFFF` for the FPGA. **This is the commit that invalidates the Core 1 timing figures.** |
+| 2026-08-22 | — | Build date of `build/new_camera_project_app.elf`, the first build containing the CRC path. |
+| 2026-08-28 | `d4c408c` | License and third-party notices |
+| 2026-08-30 | `639cfb7`, `6c4157b` | Cold-start reproducibility documentation and cross-repository guide links |
 
 ## Known limitations and next steps
 
+- **Re-measure the Core 1 per-row time on a build dated 2026-08-22 or later.** The CRC added on 2026-08-21 runs on Core 1 and is not covered by any published timing figure. If the measured value approaches the 130.167 µs line period, replace the per-bit CRC loop with a 256-entry table (same polynomial, init value, coverage and byte order; self-test `crc16_ccitt("123456789") == 0x29B1`).
 - Add receiver-side CRC failure reporting and long-duration error-injection tests.
 - Define whether offset 13 remains reserved or becomes a versioned FPGA diagnostic byte.
 - Add post-startup VSYNC monitoring or controlled realignment if long-running tests show frame-boundary drift.
