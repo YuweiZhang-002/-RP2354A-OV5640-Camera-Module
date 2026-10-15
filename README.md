@@ -29,6 +29,7 @@ English | [Chinese README](README.zh-CN.md)
 >   headroom figure.**
 >
 > The per-row hard deadline is **130.167 µs** (HTS 1562 at a 12 MHz PCLK).
+> Subsequent action will concentrates on rechecking the timing consumption required by each core, and reducing the resolution (from 480p to 320*240), if required.
 
 This repository contains firmware for an RP2354A-class controller that captures an OV5640 8-bit DVP stream, performs binary Sobel edge processing across both CPU cores, and sends one fixed-size packet per image row to an FPGA through PIO and DMA.
 
